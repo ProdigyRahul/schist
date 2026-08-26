@@ -117,6 +117,29 @@ pub enum EditOp {
         before: Box<Selection>,
         after: Box<Selection>,
     },
+    /// Document-level geometry moved with the canvas (Crop, Canvas Size,
+    /// Image Size, rotate/flip).
+    ///
+    /// Guides, artboards, slices, notes, counts and stored paths are not
+    /// layer content, so no layer op touches them and they were left at
+    /// their old coordinates while the pixels moved. They ride in the same
+    /// edit, or undo would restore the canvas and leave them where the
+    /// redo had put them.
+    GeometrySet {
+        before: Box<DocGeometry>,
+        after: Box<DocGeometry>,
+    },
+}
+
+/// A snapshot of the document-level geometry that moves with the canvas.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DocGeometry {
+    pub guides: Vec<crate::document::Guide>,
+    pub artboards: Vec<crate::annotate::Artboard>,
+    pub slices: Vec<crate::annotate::Slice>,
+    pub notes: Vec<crate::annotate::Note>,
+    pub counts: Vec<crate::annotate::CountGroup>,
+    pub paths: Vec<crate::path::VectorPath>,
 }
 
 #[derive(Debug, Clone)]
