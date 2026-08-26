@@ -111,7 +111,17 @@ pub(crate) fn commit_shape_layer(doc: &mut Document, shape: schist_core::VectorS
     layer.shape_key = key;
     layer.shape = Some(Box::new(shape));
     let id = layer.id;
-    let path = schist_core::LayerPath(vec![doc.tree.layers.len()]);
+    // Above the active layer, inside its group, exactly as the pixel-mode
+    // sibling `commit_shape` does. Going straight to the root's top meant
+    // drawing a shape while a layer inside a group was active jumped the
+    // new layer out of that group and above everything.
+    let path = match doc.active_layer.and_then(|a| doc.tree.path_of(a)) {
+        Some(mut p) => {
+            *p.0.last_mut().unwrap() += 1;
+            p
+        }
+        None => schist_core::LayerPath(vec![doc.tree.layers.len()]),
+    };
     let mut edit = doc.begin_edit(format!("{name} Layer"));
     edit.insert_layer(path, layer);
     edit.commit();
