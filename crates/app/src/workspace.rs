@@ -991,6 +991,14 @@ impl Workspace {
     /// Park the active document, view transform and all, back into the
     /// tab list at its current position.
     fn stash_active_tab(&mut self) {
+        // Park the tool before the document leaves the canvas. Transform,
+        // Liquify, Puppet Warp and Vanishing Point all hold a `LayerId`
+        // and write preview pixels straight into `raster.tiles`; layer ids
+        // are globally unique, so once another document is in front every
+        // `find_mut(session.layer)` misses and both restore and commit
+        // silently no-op. The old document was left with half-finished
+        // preview pixels, no history entry, and `dirty` never set.
+        self.deactivate_tool();
         if let Some(doc) = self.doc.take() {
             let at = self.active_tab.min(self.background_tabs.len());
             self.background_tabs.insert(
@@ -1013,6 +1021,9 @@ impl Workspace {
         self.offset = tab.offset;
         self.rotation = tab.rotation;
         self.reset_per_document_caches();
+        // The tool starts fresh against whatever is now in front, rather
+        // than carrying a session that pointed into the previous document.
+        self.activate_tool_for_current_doc();
     }
 
     /// Drop every cache keyed by document state. Revision and selection
@@ -2695,6 +2706,31 @@ impl Workspace {
             .and_then(|t| t.options().into_iter().find(|o| o.key == "wand-tolerance"))
         {
             self.editor.tolerance = t.value.num().round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    /// Commit or cancel whatever the active tool has in flight, against
+    /// the document that is currently on the canvas.
+    fn deactivate_tool(&mut self) {
+        let active = self.editor.active_tool;
+        if let (Some(doc), Some(tool)) = (self.doc.as_mut(), self.registry.tool_mut(active)) {
+            let mut ctx = ToolCtx {
+                doc,
+                state: &mut self.editor,
+            };
+            tool.on_deactivate(&mut ctx);
+        }
+    }
+
+    /// Let the active tool set itself up against the document now in front.
+    fn activate_tool_for_current_doc(&mut self) {
+        let active = self.editor.active_tool;
+        if let (Some(doc), Some(tool)) = (self.doc.as_mut(), self.registry.tool_mut(active)) {
+            let mut ctx = ToolCtx {
+                doc,
+                state: &mut self.editor,
+            };
+            tool.on_activate(&mut ctx);
         }
     }
 
