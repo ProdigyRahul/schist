@@ -424,6 +424,14 @@ impl Document {
                 self.selection = (**target).clone();
                 self.revision += 1;
             }
+            EditOp::IccProfileSet { before, after } => {
+                let target = if dir == Direction::Undo {
+                    before
+                } else {
+                    after
+                };
+                self.icc_profile = target.clone();
+            }
         }
     }
 
@@ -783,6 +791,24 @@ impl<'a> EditBuilder<'a> {
     }
 
     /// Replace the selection via closure; captures before/after.
+    /// Set the document's embedded ICC profile as part of this edit.
+    ///
+    /// Assign and Convert to Profile set it outside the edit, so undo
+    /// restored the pixels but left the new tag in place: the old numbers
+    /// were then interpreted under the wrong profile, which is worse than
+    /// either state on its own.
+    pub fn set_icc_profile(&mut self, profile: Option<Vec<u8>>) {
+        let before = self.doc.icc_profile.clone();
+        if before == profile {
+            return;
+        }
+        self.doc.icc_profile = profile.clone();
+        self.ops.push(EditOp::IccProfileSet {
+            before,
+            after: profile,
+        });
+    }
+
     pub fn change_selection(&mut self, f: impl FnOnce(&mut Selection, IntRect)) {
         let canvas = self.doc.canvas_rect();
         let before = Box::new(self.doc.selection.clone());
@@ -1172,5 +1198,38 @@ mod tests {
         assert!(!doc.selection.is_empty());
         doc.undo();
         assert!(doc.selection.is_empty());
+    }
+    #[test]
+    fn the_icc_profile_undoes_with_the_pixels() {
+        // Convert to Profile rewrites the pixels *and* the tag. Setting
+        // the tag outside the edit meant undo restored the old numbers
+        // while leaving the new profile on them, which reads as a
+        // different colour than either state.
+        let mut doc = Document::new("t", 32, 32, Depth::Eight);
+        doc.icc_profile = Some(b"OLD".to_vec());
+
+        let mut edit = doc.begin_edit("Convert");
+        edit.set_icc_profile(Some(b"NEW".to_vec()));
+        edit.commit();
+        assert_eq!(doc.icc_profile.as_deref(), Some(b"NEW".as_slice()));
+
+        doc.undo();
+        assert_eq!(
+            doc.icc_profile.as_deref(),
+            Some(b"OLD".as_slice()),
+            "undo must put the original tag back"
+        );
+        doc.redo();
+        assert_eq!(doc.icc_profile.as_deref(), Some(b"NEW".as_slice()));
+    }
+
+    #[test]
+    fn setting_the_same_profile_records_nothing() {
+        let mut doc = Document::new("t", 32, 32, Depth::Eight);
+        doc.icc_profile = Some(b"SAME".to_vec());
+        let mut edit = doc.begin_edit("Assign");
+        edit.set_icc_profile(Some(b"SAME".to_vec()));
+        edit.commit();
+        assert!(!doc.history.can_undo(), "a no-op must not enter history");
     }
 }
