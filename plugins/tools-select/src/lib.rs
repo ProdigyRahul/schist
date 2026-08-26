@@ -301,7 +301,10 @@ fn ellipse_outline(rect: IntRect) -> Vec<(f32, f32)> {
     const SEGMENTS: usize = 64;
     let (rx, ry) = (rect.width() as f32 / 2.0, rect.height() as f32 / 2.0);
     let (cx, cy) = (rect.left as f32 + rx, rect.top as f32 + ry);
-    (0..SEGMENTS)
+    // `SEGMENTS + 1` points, not `SEGMENTS`: the overlay renderer walks
+    // the list pairwise, so a ring has to repeat its first point or it
+    // draws with a gap where it should close.
+    (0..=SEGMENTS)
         .map(|i| {
             let t = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
             (cx + rx * t.cos(), cy + ry * t.sin())
