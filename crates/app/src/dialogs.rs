@@ -201,13 +201,13 @@ fn confirm_close_tab(ws: &mut Workspace, cx: &mut Context<Workspace>) -> impl In
                 true,
                 |ws, window, cx| {
                     ws.close_modal(cx);
+                    // The Save As prompt is async: it returns with the
+                    // document still dirty and finishes later, so the
+                    // close has to be pending rather than conditional.
+                    // Answering "Save…" used to save an Untitled document
+                    // and leave its tab open.
+                    ws.close_tab_after_save();
                     ws.save_current(window, cx);
-                    // The synchronous path (a known, writable path) leaves
-                    // the document clean; only then is closing safe.
-                    if ws.doc.as_ref().is_some_and(|d| !d.dirty) {
-                        let index = ws.active_tab();
-                        ws.close_tab(index, cx);
-                    }
                 },
                 cx,
             )),
