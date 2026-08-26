@@ -8,7 +8,7 @@ use crate::actions::*;
 use crate::keymap;
 use crate::panels;
 use gpui::{
-    canvas, div, point, px, size, App, Bounds, Context, FocusHandle, Focusable,
+    canvas, div, point, px, size, App, Bounds, Context, ExternalPaths, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement as _, PathBuilder, PinchEvent, Pixels, Point, Render, RenderImage,
     ScrollWheelEvent, SharedString, Styled as _, TouchPhase, Window,
@@ -198,6 +198,10 @@ pub struct Workspace {
     pub context_menu: Option<ContextMenu>,
     /// The open modal dialog, if any.
     pub modal: Option<Modal>,
+    /// A quit is waiting on the unsaved-changes prompts. Set by
+    /// `request_quit`, cleared by `cancel_quit`, and consumed by
+    /// `resume_quit` once every tab is clean.
+    pending_quit: bool,
     /// Dialogs suspended underneath `modal`, innermost last. Only the
     /// Color Picker stacks: it opens on top of a dialog that owns a colour
     /// swatch, and closing it puts that dialog back exactly as it was.
@@ -607,6 +611,9 @@ pub enum Modal {
     },
     /// "Save changes before closing?" for the active tab.
     ConfirmCloseTab,
+    /// An image file dropped on the window while a document is open:
+    /// open it in its own tab, or place it as a new layer?
+    DropImage { path: PathBuf },
     /// The third-party plugin manager.
     PluginManager,
     /// Neural Filters model downloads.
@@ -791,6 +798,7 @@ impl Workspace {
             tool_press: None,
             context_menu: None,
             modal: None,
+            pending_quit: false,
             modal_stack: Vec::new(),
             focused_field: None,
             field_buffer: String::new(),
@@ -1070,6 +1078,44 @@ impl Workspace {
         }
     }
 
+    /// Index of the first tab with unsaved changes, if any.
+    pub fn first_dirty_tab(&self) -> Option<usize> {
+        self.tab_strip().iter().position(|(_, dirty)| *dirty)
+    }
+
+    /// Begin quitting: prompt for each dirty tab, then quit.
+    ///
+    /// The window's `should_close` hook is synchronous and the prompt is
+    /// not, so quitting is vetoed and resumed here once the prompts are
+    /// answered.
+    pub fn request_quit(&mut self, cx: &mut Context<Self>) {
+        match self.first_dirty_tab() {
+            Some(index) => {
+                self.pending_quit = true;
+                self.select_tab(index, cx);
+                self.open_modal(Modal::ConfirmCloseTab, cx);
+            }
+            None => {
+                self.pending_quit = false;
+                cx.quit();
+            }
+        }
+    }
+
+    /// The user backed out of one of the prompts, so the quit is off.
+    pub fn cancel_quit(&mut self) {
+        self.pending_quit = false;
+    }
+
+    /// Continue a quit after a tab was saved or discarded: prompt for the
+    /// next dirty tab, or quit once none are left. A no-op when the user
+    /// is just closing a tab.
+    pub fn resume_quit(&mut self, cx: &mut Context<Self>) {
+        if self.pending_quit {
+            self.request_quit(cx);
+        }
+    }
+
     /// Close tab `index` outright, discarding any unsaved changes. Closing
     /// the last tab leaves an empty workspace.
     pub fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1142,6 +1188,116 @@ impl Workspace {
                 self.status = format!("Open failed: {err}").into();
             }
         }
+    }
+
+    /// Files dragged from the OS and dropped anywhere in the window.
+    ///
+    /// Layered documents always open in their own tabs. A flat image
+    /// dropped onto an open document could mean "open it" or "place it",
+    /// so that case asks; with several files, or nothing to place into,
+    /// everything just opens.
+    pub fn handle_dropped_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if let [path] = paths.as_slice() {
+            if self.doc.is_some() && self.is_flat_image(path) {
+                self.open_modal(Modal::DropImage { path: path.clone() }, cx);
+                return;
+            }
+        }
+        for path in paths {
+            self.load_file(path, cx);
+        }
+    }
+
+    /// True when the extension belongs to a single-layer image format.
+    /// Layered formats never make sense as one new layer.
+    fn is_flat_image(&self, path: &std::path::Path) -> bool {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return false;
+        };
+        let ext = ext.to_ascii_lowercase();
+        self.registry
+            .codecs()
+            .find(|c| c.extensions().contains(&ext.as_str()))
+            .is_some_and(|c| !matches!(c.id(), "codec.psd" | "codec.affinity"))
+    }
+
+    /// Decode `path` off the UI thread and insert it into the current
+    /// document as a new raster layer, centered like a paste.
+    pub fn place_image_as_layer(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.status = format!("Placing {}\u{2026}", path.display()).into();
+        cx.notify();
+        let codecs = self.registry.shared_codecs();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let doc = decode_file(&codecs, &path)?;
+                    // The codec hands back a document; the layer wants
+                    // pixels, so flatten it.
+                    let rect = doc.canvas_rect();
+                    let rgba = schist_compositor::composite_region_rgba8(&doc, rect);
+                    anyhow::Ok((path, doc.title, rect, rgba))
+                })
+                .await;
+            this.update(cx, |ws, cx| {
+                ws.finish_place(result, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_place(
+        &mut self,
+        result: anyhow::Result<(PathBuf, String, IntRect, Vec<u8>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let (path, title, rect, rgba) = match result {
+            Ok(r) => r,
+            Err(err) => {
+                log::error!("place failed: {err:#}");
+                self.status = format!("Place failed: {err}").into();
+                return;
+            }
+        };
+        if self.doc.is_none() {
+            // The tab closed while the file decoded; open it in its own
+            // tab instead of dropping it on the floor.
+            self.load_file(path, cx);
+            return;
+        }
+        let doc = self.doc.as_mut().unwrap();
+        // Centered, like paste with no selection.
+        let cw = doc.width as i32;
+        let ch = doc.height as i32;
+        let dest = IntRect::from_xywh(
+            (cw - rect.width()) / 2,
+            (ch - rect.height()) / 2,
+            rect.width() as u32,
+            rect.height() as u32,
+        );
+        let mut layer = Layer::new_raster(title.clone());
+        blit_rgba8(
+            &mut layer.as_raster_mut().unwrap().tiles,
+            doc.depth,
+            dest,
+            &rgba,
+        );
+        let id = layer.id;
+        let insert_at = match doc.active_layer.and_then(|a| doc.tree.path_of(a)) {
+            Some(mut p) => {
+                *p.0.last_mut().unwrap() += 1;
+                p
+            }
+            None => schist_core::LayerPath(vec![doc.tree.layers.len()]),
+        };
+        let mut edit = doc.begin_edit("Place Image");
+        edit.insert_layer(insert_at, layer);
+        edit.commit();
+        doc.active_layer = Some(id);
+        self.status = format!("Placed {title}").into();
+        self.after_change(cx);
     }
 
     /// Serialize the document to `path`, choosing the codec by extension.
@@ -2659,6 +2815,18 @@ impl Workspace {
     }
 
     pub fn run_command(&mut self, id: &str, cx: &mut Context<Self>) {
+        // Copy, cut and paste mean text when something is taking typing.
+        // The clipboard held pixels and nothing else, so ctrl-V while
+        // typing into a text layer pasted a "Pasted Layer" of pixels on
+        // top of the text rather than the string that had been copied,
+        // and ctrl-C copied the selection's pixels instead of the words.
+        if matches!(
+            id,
+            "edit.copy" | "edit.copy_merged" | "edit.cut" | "edit.paste"
+        ) && self.text_clipboard(id, cx)
+        {
+            return;
+        }
         // Grow, Similar and Color Range take their tolerance from the
         // magic wand, exactly as Photoshop does.
         self.sync_wand_tolerance();
@@ -2684,6 +2852,124 @@ impl Workspace {
             log::warn!("unknown command {id}");
         }
         self.after_change(cx);
+    }
+
+    /// Handle copy / cut / paste as text when a text sink has focus.
+    ///
+    /// Returns true when it did, so the pixel commands are skipped.
+    fn text_clipboard(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        /// Which sink, in the order the key listeners try them.
+        enum Sink {
+            Rename,
+            Field,
+            Tool,
+        }
+        let tool_id = self.editor.active_tool;
+        let sink = if self.layer_rename.is_some() {
+            Sink::Rename
+        } else if self.focused_field.is_some() {
+            Sink::Field
+        } else if self
+            .registry
+            .tool_mut(tool_id)
+            .is_some_and(|t| t.editing_text().is_some())
+        {
+            Sink::Tool
+        } else {
+            return false;
+        };
+
+        if id == "edit.paste" {
+            let Some(text) = Self::clipboard_text(cx) else {
+                // Nothing textual on the clipboard: say so rather than
+                // pasting pixels over the words.
+                self.status = "Nothing on the clipboard to paste as text".into();
+                cx.notify();
+                return true;
+            };
+            let one_line = text.trim_end_matches('\n');
+            match sink {
+                Sink::Rename => {
+                    if let Some((_, name)) = self.layer_rename.as_mut() {
+                        name.push_str(one_line);
+                    }
+                }
+                Sink::Field => {
+                    self.field_buffer.push_str(one_line);
+                    if let Some(field) = self.focused_field {
+                        self.commit_field_value(field);
+                    }
+                }
+                Sink::Tool => {
+                    if let (Some(doc), Some(tool)) =
+                        (self.doc.as_mut(), self.registry.tool_mut(tool_id))
+                    {
+                        let mut ctx = ToolCtx {
+                            doc,
+                            state: &mut self.editor,
+                        };
+                        tool.insert_text(&mut ctx, &text);
+                    }
+                }
+            }
+            self.after_change(cx);
+            return true;
+        }
+
+        // Copy or cut.
+        let cut = id == "edit.cut";
+        let text = match sink {
+            Sink::Rename => {
+                let text = self.layer_rename.as_ref().map(|(_, n)| n.clone());
+                if cut {
+                    if let Some((_, name)) = self.layer_rename.as_mut() {
+                        name.clear();
+                    }
+                }
+                text
+            }
+            Sink::Field => {
+                let text = Some(self.field_buffer.clone());
+                if cut {
+                    self.field_buffer.clear();
+                    if let Some(field) = self.focused_field {
+                        self.commit_field_value(field);
+                    }
+                }
+                text
+            }
+            Sink::Tool => match (self.doc.as_mut(), self.registry.tool_mut(tool_id)) {
+                (Some(doc), Some(tool)) => {
+                    if cut {
+                        let mut ctx = ToolCtx {
+                            doc,
+                            state: &mut self.editor,
+                        };
+                        tool.take_text(&mut ctx)
+                    } else {
+                        tool.editing_text().map(str::to_string)
+                    }
+                }
+                _ => None,
+            },
+        };
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+        self.after_change(cx);
+        true
+    }
+
+    /// A string from the system clipboard, if there is one.
+    ///
+    /// `sync_clipboard_in` walks the same entries but `continue`s on
+    /// anything that is not an image, so text was simply never seen.
+    fn clipboard_text(cx: &mut Context<Self>) -> Option<String> {
+        let item = cx.read_from_clipboard()?;
+        item.entries().iter().find_map(|entry| match entry {
+            gpui::ClipboardEntry::String(s) if !s.text().is_empty() => Some(s.text().to_string()),
+            _ => None,
+        })
     }
 
     /// Mirror the magic wand's tolerance into the shared editor state.
@@ -2811,6 +3097,11 @@ impl Workspace {
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // An OS file drag reaches here as synthetic left-button moves;
+        // they must not feed the active tool.
+        if cx.has_active_drag() {
+            return;
+        }
         if self.dragging_guide() {
             let horizontal = self.dragging_guide.map(|g| g.horizontal).unwrap_or(false);
             let position = if horizontal {
@@ -3648,6 +3939,11 @@ impl Workspace {
             "backspace" => {
                 self.field_buffer.pop();
             }
+            // Escape is handled in `cancel_gesture`, which runs first:
+            // it is bound to `CancelGesture` in the always-matching
+            // "Workspace" context, so nothing escape-shaped ever reaches
+            // here. Kept as a fallback for a build with that binding
+            // removed rather than left as a dead arm that looks live.
             "escape" => {
                 self.focused_field = None;
                 self.field_buffer.clear();
@@ -3794,6 +4090,7 @@ impl Workspace {
             // These dialogs have no typed fields.
             Modal::DestructiveAdjustment { .. }
             | Modal::ConfirmCloseTab
+            | Modal::DropImage { .. }
             | Modal::ModelManager
             | Modal::FilterGallery { .. }
             | Modal::Stroke { .. }
@@ -3869,6 +4166,17 @@ impl Workspace {
         }
         if self.context_menu.is_some() {
             self.close_context_menu(cx);
+            return;
+        }
+        // A focused field takes the escape first: it drops focus and
+        // leaves the dialog up, which is what `field_key`'s "escape" arm
+        // meant to do before `CancelGesture` -- bound in the
+        // always-matching "Workspace" context -- got there ahead of it
+        // and closed the whole dialog instead.
+        if self.modal.is_some() && self.focused_field.is_some() {
+            self.focused_field = None;
+            self.field_buffer.clear();
+            cx.notify();
             return;
         }
         if self.modal.is_some() {
@@ -4853,11 +5161,16 @@ impl Workspace {
                         // The engine caches parsed faces and the family
                         // list; both are stale until it re-scans.
                         schist_text_engine::refresh();
-                        let redrawn = ws
+                        // Parked tabs too: they were left with the
+                        // substituted glyphs until they were reopened.
+                        let mut redrawn = ws
                             .doc
                             .as_mut()
                             .map(|doc| schist_tools_type::rerender_family(doc, &family))
                             .unwrap_or(0);
+                        for tab in ws.background_tabs.iter_mut() {
+                            redrawn += schist_tools_type::rerender_family(&mut tab.doc, &family);
+                        }
                         ws.refresh_missing_fonts();
                         format!(
                             "Installed {target} ({n} faces) \u{b7} re-set {redrawn} text layer(s)"
@@ -6076,6 +6389,10 @@ impl Render for Workspace {
             } else {
                 "Workspace editable"
             })
+            // Files dragged in from the OS: anywhere in the window works.
+            .on_drop(cx.listener(|ws, paths: &ExternalPaths, _w, cx| {
+                ws.handle_dropped_paths(paths.paths().to_vec(), cx);
+            }))
             .on_action(cx.listener(|ws, action: &RunCommand, _w, cx| {
                 ws.run_command(&action.id.clone(), cx);
             }))
@@ -6536,6 +6853,22 @@ mod tests {
     #[test]
     fn no_snapshots_is_not_an_error() {
         assert!(Workspace::rank_snapshots(Vec::new(), 1).is_empty());
+    }
+
+    #[test]
+    fn first_dirty_tab_picks_the_earliest_unsaved_one() {
+        // `first_dirty_tab` is what decides whether quitting prompts, so
+        // its contract is worth pinning even though the tab strip itself
+        // needs a running window.
+        let strip: Vec<(&str, bool)> =
+            vec![("clean", false), ("also clean", false), ("dirty", true)];
+        assert_eq!(strip.iter().position(|(_, d)| *d), Some(2));
+
+        let strip: Vec<(&str, bool)> = vec![("clean", false), ("clean too", false)];
+        assert_eq!(strip.iter().position(|(_, d)| *d), None);
+
+        let strip: Vec<(&str, bool)> = vec![("dirty", true), ("dirty", true)];
+        assert_eq!(strip.iter().position(|(_, d)| *d), Some(0));
     }
 
     use super::*;

@@ -432,6 +432,120 @@ fn load_font(family: &str, bold: bool, italic: bool) -> Option<LoadedFace> {
     font
 }
 
+/// A face that actually has the glyph for `ch`.
+///
+/// `load_font` resolves one face for the whole spec and every glyph is
+/// rasterized from it. fontdue maps a codepoint the face does not cover
+/// to glyph 0, so `.notdef` -- the tofu box -- is drawn. Typing Japanese
+/// or an emoji gave a row of empty rectangles even with Noto CJK and
+/// Noto Color Emoji installed.
+///
+/// Returns `None` when the primary face already covers `ch`, so the
+/// common path allocates and locks nothing.
+fn fallback_for(ch: char, primary: &LoadedFace, bold: bool, italic: bool) -> Option<LoadedFace> {
+    // Whitespace has no ink; asking for a face for it would pick one at
+    // random and drag its metrics in.
+    if ch.is_whitespace() || primary.font.has_glyph(ch) {
+        return None;
+    }
+    let key = (fallback_key(ch), bold, italic);
+    if let Some(hit) = fallback_cache().lock().ok()?.get(&key) {
+        return hit.clone();
+    }
+    // Named preferences first -- they are what a person would pick, and
+    // they avoid a scan in the cases that actually come up.
+    let mut found = None;
+    for name in preferred_families(ch) {
+        if let Some(face) = load_font(name, bold, italic) {
+            if face.font.has_glyph(ch) {
+                found = Some(face);
+                break;
+            }
+        }
+    }
+    // Otherwise ask every installed face, once per script bucket.
+    if found.is_none() {
+        let ids: Vec<fontdb::ID> = db().faces().map(|f| f.id).collect();
+        for id in ids {
+            let covers = db()
+                .with_face_data(id, |data, index| {
+                    ttf_parser::Face::parse(data, index)
+                        .ok()
+                        .and_then(|f| f.glyph_index(ch))
+                        .is_some()
+                })
+                .unwrap_or(false);
+            if !covers {
+                continue;
+            }
+            let family = db()
+                .face(id)
+                .and_then(|f| f.families.first().map(|(n, _)| n.clone()));
+            if let Some(face) = family.and_then(|n| load_font(&n, bold, italic)) {
+                if face.font.has_glyph(ch) {
+                    found = Some(face);
+                    break;
+                }
+            }
+        }
+    }
+    if found.is_none() {
+        log::debug!("text-engine: no installed face covers U+{:04X}", ch as u32);
+    }
+    if let Ok(mut c) = fallback_cache().lock() {
+        c.insert(key, found.clone());
+    }
+    found
+}
+
+/// Which script bucket a character falls in, so the fallback is resolved
+/// once per script rather than once per character.
+fn fallback_key(ch: char) -> u32 {
+    let c = ch as u32;
+    match c {
+        0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0xFE00..=0xFE0F => 1, // emoji and symbols
+        0x3000..=0x30FF | 0x31F0..=0x31FF | 0xFF00..=0xFFEF => 2,   // kana and CJK punctuation
+        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0xF900..=0xFAFF => 3,   // han
+        0xAC00..=0xD7AF | 0x1100..=0x11FF => 4,                     // hangul
+        0x0590..=0x05FF => 5,                                       // hebrew
+        0x0600..=0x06FF | 0x0750..=0x077F => 6,                     // arabic
+        0x0900..=0x097F => 7,                                       // devanagari
+        0x0E00..=0x0E7F => 8,                                       // thai
+        _ => 0,
+    }
+}
+
+/// Families worth trying for a character before scanning everything.
+fn preferred_families(ch: char) -> &'static [&'static str] {
+    match fallback_key(ch) {
+        1 => &["Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji"],
+        2 | 3 => &[
+            "Noto Sans CJK JP",
+            "Noto Sans CJK SC",
+            "Noto Sans JP",
+            "Source Han Sans",
+            "Hiragino Sans",
+            "Yu Gothic",
+        ],
+        4 => &["Noto Sans CJK KR", "Noto Sans KR", "Malgun Gothic"],
+        5 => &["Noto Sans Hebrew", "David"],
+        6 => &["Noto Sans Arabic", "Geeza Pro"],
+        7 => &["Noto Sans Devanagari", "Mangal"],
+        8 => &["Noto Sans Thai", "Thonburi"],
+        _ => &[],
+    }
+}
+
+type FallbackKey = (u32, bool, bool);
+
+fn fallback_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<FallbackKey, Option<LoadedFace>>> {
+    static CACHE: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<FallbackKey, Option<LoadedFace>>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// The GPOS `kern`-feature pair adjustments of a face, resolved once per
 /// layout. fontdue reads only the legacy `kern` table; most modern faces
 /// keep their kerning here instead, and Affinity applies it, so matching
@@ -546,7 +660,25 @@ fn layout(spec: &TextSpec, face: &LoadedFace) -> Layout {
     // A face with GPOS kerning speaks through it alone; the legacy
     // `kern` table is only consulted when there is no GPOS to read.
     let gpos = GposKern::new(&face.data, face.index, spec.size);
-    let advance = |ch: char, prev: Option<char>| -> f32 {
+    // A tab is a stop, not a glyph. Four spaces wide, as every editor
+    // and word processor has settled on. The Type tool turns a Tab
+    // keypress into four spaces, but text arriving from a PSD's `PsTx`
+    // block can contain a real `\t`, and asking the font for the tab
+    // glyph's advance gave it a single ~11 px step -- so imported tabbed
+    // text did not line up in any column.
+    let tab_stop = (font.metrics(' ', spec.size).advance_width * 4.0).max(1.0);
+    // `pen` is the position along the line, measured from the line's own
+    // start, which is what a tab stop is relative to.
+    let advance = |ch: char, prev: Option<char>, pen: f32| -> f32 {
+        if ch == '\t' {
+            return ((pen / tab_stop).floor() + 1.0) * tab_stop - pen;
+        }
+        // A glyph the chosen face does not cover is drawn from a
+        // fallback, so its advance has to come from there too or the
+        // text would be laid out against the .notdef box's width.
+        if let Some(fb) = fallback_for(ch, face, spec.bold, spec.italic) {
+            return fb.font.metrics(ch, spec.size).advance_width + spec.tracking;
+        }
         let m = font.metrics(ch, spec.size);
         let kern = prev
             .and_then(|p| match &gpos {
@@ -569,7 +701,7 @@ fn layout(spec: &TextSpec, face: &LoadedFace) -> Layout {
             let mut word_width = 0.0;
             let mut p = prev;
             for ch in word.chars() {
-                word_width += advance(ch, p);
+                word_width += advance(ch, p, width + word_width);
                 p = Some(ch);
             }
             let wraps = spec
@@ -583,7 +715,7 @@ fn layout(spec: &TextSpec, face: &LoadedFace) -> Layout {
                 let mut p = None;
                 word_width = 0.0;
                 for ch in word.chars() {
-                    word_width += advance(ch, p);
+                    word_width += advance(ch, p, word_width);
                     p = Some(ch);
                 }
             }
@@ -594,21 +726,57 @@ fn layout(spec: &TextSpec, face: &LoadedFace) -> Layout {
         lines.push((current, width));
     }
 
-    let max_width = lines.iter().map(|(_, w)| *w).fold(0.0f32, f32::max);
+    // Alignment measures the *visible* line. `split_inclusive(' ')` keeps
+    // each word's trailing space, so a line ending in one measured wider
+    // than its ink and right- and centre-aligned text hung short of the
+    // edge by exactly that space.
+    // Alignment measures the *visible* line. `split_inclusive(' ')` keeps
+    // each word's trailing space, so a line ending in one measured wider
+    // than its ink and right- and centre-aligned text hung short of the
+    // edge by exactly that space.
+    //
+    // Walking the pen rather than subtracting a trailing run also gets
+    // tabs right: a tab's width depends on where it starts, so it cannot
+    // be measured in isolation.
+    let visible = |line: &str| -> f32 {
+        let mut pen = 0.0f32;
+        let mut ink_end = 0.0f32;
+        let mut prev: Option<char> = None;
+        for ch in line.chars() {
+            pen += advance(ch, prev, pen);
+            if !ch.is_whitespace() {
+                ink_end = pen;
+            }
+            prev = Some(ch);
+        }
+        ink_end
+    };
+    let widths: Vec<f32> = lines.iter().map(|(l, _)| visible(l)).collect();
+    // Wrapped text aligns to its own box, not to whichever line happens to
+    // be longest.
+    let max_width = spec
+        .wrap_width
+        .unwrap_or_else(|| widths.iter().copied().fold(0.0f32, f32::max));
     let mut placed = Vec::new();
-    for (i, (line, width)) in lines.iter().enumerate() {
+    for (i, (line, _)) in lines.iter().enumerate() {
+        let width = widths[i];
         let baseline = ascent + i as f32 * line_advance;
-        let mut x = match spec.align {
+        let start_x = match spec.align {
             Align::Left => 0.0,
             Align::Center => (max_width - width) / 2.0,
             Align::Right => max_width - width,
         };
         let mut prev: Option<char> = None;
+        let mut pen = 0.0f32;
         for ch in line.chars() {
             if !ch.is_whitespace() {
-                placed.push(PlacedGlyph { ch, x, baseline });
+                placed.push(PlacedGlyph {
+                    ch,
+                    x: start_x + pen,
+                    baseline,
+                });
             }
-            x += advance(ch, prev);
+            pen += advance(ch, prev, pen);
             prev = Some(ch);
         }
     }
@@ -658,7 +826,9 @@ pub fn rasterize(spec: &TextSpec) -> Option<TextRaster> {
     let mut rasterized = Vec::with_capacity(placed.len());
     let mut bounds = IntRect::EMPTY;
     for g in &placed {
-        let (metrics, bitmap) = font.rasterize(g.ch, spec.size);
+        let fb = fallback_for(g.ch, &face, spec.bold, spec.italic);
+        let glyph_font = fb.as_ref().map_or(font, |f| &f.font);
+        let (metrics, bitmap) = glyph_font.rasterize(g.ch, spec.size);
         if metrics.width == 0 || metrics.height == 0 {
             continue;
         }
@@ -852,5 +1022,168 @@ mod tests {
         });
         assert!(r.is_some(), "should fall back to a system sans");
         assert!(!r.unwrap().is_empty());
+    }
+    /// Right edge of the rendered ink.
+    fn right_edge(r: &TextRaster) -> i32 {
+        r.bounds.right
+    }
+
+    #[test]
+    fn a_trailing_space_does_not_shift_aligned_text() {
+        // `split_inclusive(' ')` keeps each word's trailing space, and the
+        // alignment offset was computed from that padded width, so a line
+        // ending in a space hung short of the edge by exactly one space.
+        let render = |text: &str| {
+            rasterize(&TextSpec {
+                text: text.into(),
+                size: 32.0,
+                align: Align::Right,
+                ..Default::default()
+            })
+            .expect("rasterized")
+        };
+        let without = render("mmmm\nX");
+        let with = render("mmmm\nX ");
+        assert_eq!(
+            right_edge(&without),
+            right_edge(&with),
+            "a trailing space must not move the ink"
+        );
+    }
+
+    #[test]
+    fn wrapped_text_aligns_to_its_box_not_its_longest_line() {
+        // `max_width` was the widest *rendered* line, so right-aligned
+        // paragraph text sat inside its own frame by however much the
+        // longest line fell short of the wrap width.
+        let spec = TextSpec {
+            text: "aaa bbb ccc ddd eee fff".into(),
+            size: 24.0,
+            align: Align::Right,
+            wrap_width: Some(400.0),
+            ..Default::default()
+        };
+        let r = rasterize(&spec).expect("rasterized");
+        assert_eq!(
+            r.layout_width, 400.0,
+            "the alignment box is the wrap width, not the longest line"
+        );
+    }
+
+    /// A tab is a stop, not a glyph.
+    ///
+    /// `advance` had no `'\t'` case, so it asked the font for the tab
+    /// glyph's advance and got a single ~11 px step. The Type tool turns
+    /// a Tab keypress into four spaces, but text arriving from a PSD's
+    /// `PsTx` block can hold a real tab, and tabbed text imported that
+    /// way lined up in no column at all.
+    #[test]
+    fn a_tab_aligns_prefixes_that_share_a_stop() {
+        // Full stops are narrow enough that one, two and three of them
+        // all sit inside the first stop, which is where a tab is
+        // supposed to hide the difference.
+        let one = rasterize(&spec(".\tX")).expect("font loads");
+        let two = rasterize(&spec("..\tX")).expect("font loads");
+        let three = rasterize(&spec("...\tX")).expect("font loads");
+        assert!(
+            (one.layout_width - two.layout_width).abs() < 0.5
+                && (one.layout_width - three.layout_width).abs() < 0.5,
+            "the tab did not align the column: {} / {} / {}",
+            one.layout_width,
+            two.layout_width,
+            three.layout_width
+        );
+        // Without the tab they differ, so the test is measuring the tab
+        // rather than a font that renders every prefix the same width.
+        let plain_one = rasterize(&spec(".X")).expect("font loads");
+        let plain_three = rasterize(&spec("...X")).expect("font loads");
+        assert!(plain_three.layout_width > plain_one.layout_width + 1.0);
+    }
+
+    /// A prefix past the first stop reaches the next one, so the stops
+    /// are a grid rather than a fixed pad.
+    #[test]
+    fn a_long_prefix_reaches_the_next_stop() {
+        let short = rasterize(&spec(".\tX")).expect("font loads");
+        let long = rasterize(&spec("MMMMMM\tX")).expect("font loads");
+        assert!(
+            long.layout_width > short.layout_width + 1.0,
+            "{} did not clear the first stop ({})",
+            long.layout_width,
+            short.layout_width
+        );
+    }
+
+    /// Stops are measured from each line's own start, so a wide line does
+    /// not drag the line below it out of column.
+    #[test]
+    fn tab_stops_are_per_line() {
+        let alone = rasterize(&spec(".\tX")).expect("font loads");
+        let under = rasterize(&spec("MMMMMM\tX\n.\tX")).expect("font loads");
+        // The second line still sits on the first stop, so the block is
+        // exactly as wide as its widest line -- the long one.
+        let long = rasterize(&spec("MMMMMM\tX")).expect("font loads");
+        assert!(
+            (under.layout_width - long.layout_width).abs() < 0.5,
+            "the short line drifted: {} vs {}",
+            under.layout_width,
+            long.layout_width
+        );
+        assert!(long.layout_width > alone.layout_width);
+    }
+
+    /// Every glyph was rasterized from one face, and fontdue maps a
+    /// codepoint that face does not cover to glyph 0 — the .notdef box.
+    /// The tell is identical ink per glyph across unrelated characters:
+    /// the same empty rectangle repeated.
+    #[test]
+    fn characters_outside_the_chosen_face_are_not_all_the_same_box() {
+        let hiragana = rasterize(&spec("\u{3053}\u{3093}\u{306b}")).expect("font loads");
+        let han = rasterize(&spec("\u{4e2d}\u{6587}\u{5b57}")).expect("font loads");
+        if hiragana.is_empty() || han.is_empty() {
+            // A machine with no CJK face installed has nothing to fall
+            // back to, and drawing tofu is then the honest answer.
+            return;
+        }
+        let per_glyph = |r: &TextRaster| ink(r) as f32 / 3.0;
+        let (a, b) = (per_glyph(&hiragana), per_glyph(&han));
+        assert!(
+            (a - b).abs() > 1.0,
+            "hiragana and han have identical ink per glyph ({a} vs {b}), \
+             which is the .notdef box repeated"
+        );
+    }
+
+    /// And the fallback's advance is used, so the layout is not measured
+    /// against the box it is not drawing.
+    #[test]
+    fn a_fallback_glyph_advances_by_its_own_width() {
+        let narrow = rasterize(&spec("AA")).expect("font loads");
+        let cjk = rasterize(&spec("\u{4e2d}\u{6587}"));
+        let Some(cjk) = cjk else { return };
+        if cjk.is_empty() {
+            return;
+        }
+        // Han glyphs are full-width; two of them are wider than two
+        // latin capitals at the same size.
+        assert!(
+            cjk.layout_width > narrow.layout_width,
+            "{} should exceed {}",
+            cjk.layout_width,
+            narrow.layout_width
+        );
+    }
+
+    /// Characters the chosen face does cover keep using it, so nothing
+    /// about ordinary latin text changes.
+    #[test]
+    fn covered_characters_do_not_go_through_the_fallback() {
+        let face = load_font(&default_family(), false, false).expect("a default face");
+        for ch in "Hello, world! 123".chars() {
+            assert!(
+                fallback_for(ch, &face, false, false).is_none(),
+                "{ch:?} should not need a fallback"
+            );
+        }
     }
 }
