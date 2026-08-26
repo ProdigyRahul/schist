@@ -28,7 +28,7 @@ fn import_with(format: ImageFormat, bytes: &[u8], title: &str) -> anyhow::Result
     );
     doc.push_layer(layer);
     doc.damage_all();
-    doc.dirty = false;
+    doc.mark_saved();
     Ok(doc)
 }
 
