@@ -282,11 +282,31 @@ impl ToolPlugin for MarqueeTool {
     }
 
     fn overlays(&self, _doc: &Document, _state: &EditorState) -> Vec<Overlay> {
-        match self.current {
-            Some(rect) => vec![Overlay::AntsRect(rect)],
-            None => Vec::new(),
+        let Some(rect) = self.current else {
+            return Vec::new();
+        };
+        match self.shape {
+            MarqueeShape::Rect => vec![Overlay::AntsRect(rect)],
+            // Both shapes previewed as a rectangle, so an elliptical drag
+            // showed the wrong outline right up until the mouse went up.
+            MarqueeShape::Ellipse => vec![Overlay::AntsPolygon(ellipse_outline(rect))],
         }
     }
+}
+
+/// An ellipse inscribed in `rect`, flattened to a closed polyline.
+fn ellipse_outline(rect: IntRect) -> Vec<(f32, f32)> {
+    // Enough segments that the curve reads as one at any sane zoom, and
+    // few enough to stay cheap to redraw every pointer move.
+    const SEGMENTS: usize = 64;
+    let (rx, ry) = (rect.width() as f32 / 2.0, rect.height() as f32 / 2.0);
+    let (cx, cy) = (rect.left as f32 + rx, rect.top as f32 + ry);
+    (0..SEGMENTS)
+        .map(|i| {
+            let t = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            (cx + rx * t.cos(), cy + ry * t.sin())
+        })
+        .collect()
 }
 
 /// Which of Photoshop's three lassos this instance is.
@@ -528,6 +548,25 @@ impl ToolPlugin for LassoTool {
 
     fn on_commit(&mut self, ctx: &mut ToolCtx) {
         self.commit(ctx);
+    }
+
+    fn on_key(
+        &mut self,
+        _ctx: &mut ToolCtx,
+        key: &str,
+        _text: Option<&str>,
+        _modifiers: Modifiers,
+    ) -> bool {
+        // Backspace drops the last anchor. Without it one misplaced click
+        // in a long polygonal selection meant starting over: escape
+        // discards the whole path and nothing else was handled.
+        if self.kind == LassoKind::Free {
+            return false;
+        }
+        match key {
+            "backspace" | "delete" => self.points.pop().is_some(),
+            _ => false,
+        }
     }
 
     fn on_cancel(&mut self, _ctx: &mut ToolCtx) {
@@ -1551,5 +1590,72 @@ mod new_tool_tests {
             tool.on_pointer_down(&mut ctx, input(20.0, 20.0, Modifiers::default()));
         }
         assert_eq!(doc.selection.coverage(80, 80), 255, "missed the far square");
+    }
+    #[test]
+    fn the_elliptical_marquee_previews_an_ellipse() {
+        // Both shapes emitted `AntsRect`, so an elliptical drag showed a
+        // rectangle right up until the mouse went up.
+        let mut doc = Document::new("t", 200, 200, Depth::Eight);
+        let mut state = EditorState::default();
+        let mut tool = MarqueeTool::new(MarqueeShape::Ellipse);
+        let mut ctx = ToolCtx {
+            doc: &mut doc,
+            state: &mut state,
+        };
+        tool.on_pointer_down(&mut ctx, input(20.0, 40.0, Modifiers::default()));
+        tool.on_pointer_move(&mut ctx, input(120.0, 100.0, Modifiers::default()));
+
+        let overlays = tool.overlays(ctx.doc, ctx.state);
+        let Some(Overlay::AntsPolygon(points)) = overlays.first() else {
+            panic!("expected an ellipse outline, got {overlays:?}");
+        };
+        // Every point sits on the ellipse inscribed in the drag rect.
+        let (cx, cy, rx, ry) = (70.0f32, 70.0f32, 50.0f32, 30.0f32);
+        for &(x, y) in points {
+            let d = ((x - cx) / rx).powi(2) + ((y - cy) / ry).powi(2);
+            assert!((d - 1.0).abs() < 1e-3, "({x}, {y}) is not on the ellipse");
+        }
+        // ... and it is a curve, not four corners.
+        assert!(points.len() > 16);
+    }
+
+    #[test]
+    fn backspace_drops_the_last_polygonal_anchor() {
+        // Without this, one misplaced click in a long polygonal selection
+        // meant restarting: escape discards the whole path, and nothing
+        // else was handled.
+        let mut doc = Document::new("t", 200, 200, Depth::Eight);
+        let mut state = EditorState::default();
+        let mut tool = LassoTool::new(LassoKind::Polygonal);
+        let mut ctx = ToolCtx {
+            doc: &mut doc,
+            state: &mut state,
+        };
+        for p in [(10.0, 10.0), (90.0, 10.0), (90.0, 90.0), (11.0, 91.0)] {
+            tool.on_pointer_down(&mut ctx, input(p.0, p.1, Modifiers::default()));
+            tool.on_pointer_up(&mut ctx, input(p.0, p.1, Modifiers::default()));
+        }
+        assert_eq!(tool.points.len(), 4);
+        assert!(tool.on_key(&mut ctx, "backspace", None, Modifiers::default()));
+        assert_eq!(tool.points.len(), 3);
+
+        // An empty path has nothing to drop, and the key is not claimed.
+        tool.points.clear();
+        assert!(!tool.on_key(&mut ctx, "backspace", None, Modifiers::default()));
+    }
+
+    /// The freehand lasso has no anchors to drop; it must leave backspace
+    /// to whatever else wants it.
+    #[test]
+    fn the_freehand_lasso_does_not_claim_backspace() {
+        let mut doc = Document::new("t", 200, 200, Depth::Eight);
+        let mut state = EditorState::default();
+        let mut tool = LassoTool::new(LassoKind::Free);
+        let mut ctx = ToolCtx {
+            doc: &mut doc,
+            state: &mut state,
+        };
+        tool.on_pointer_down(&mut ctx, input(10.0, 10.0, Modifiers::default()));
+        assert!(!tool.on_key(&mut ctx, "backspace", None, Modifiers::default()));
     }
 }

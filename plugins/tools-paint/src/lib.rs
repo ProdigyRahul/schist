@@ -598,7 +598,10 @@ fn paintable_layer(doc: &Document) -> Option<LayerId> {
 pub struct PaintTool {
     mode: PaintMode,
     stroke: Option<Stroke>,
+    /// Where the brush cursor sits, and the pressure it was last drawn
+    /// with, so the preview circle matches the dab it would leave.
     cursor: Option<(f32, f32)>,
+    cursor_pressure: f32,
     /// Clone stamp: the alt-clicked source point, and the offset locked in
     /// when the first stroke after it begins.
     clone_source: Option<(f32, f32)>,
@@ -613,6 +616,7 @@ impl PaintTool {
             mode,
             stroke: None,
             cursor: None,
+            cursor_pressure: 1.0,
             clone_source: None,
             clone_offset: None,
             tolerance: 0.12,
@@ -808,6 +812,7 @@ impl ToolPlugin for PaintTool {
 
     fn on_pointer_down(&mut self, ctx: &mut ToolCtx, input: PointerInput) {
         self.cursor = Some((input.x, input.y));
+        self.cursor_pressure = input.pressure;
         // Alt-click sets the clone stamp's source point.
         if matches!(self.mode, PaintMode::Clone | PaintMode::Heal) && input.modifiers.alt {
             self.clone_source = Some((input.x, input.y));
@@ -823,6 +828,7 @@ impl ToolPlugin for PaintTool {
 
     fn on_pointer_move(&mut self, ctx: &mut ToolCtx, input: PointerInput) {
         self.cursor = Some((input.x, input.y));
+        self.cursor_pressure = input.pressure;
         if let Some(stroke) = &mut self.stroke {
             stroke.extend(ctx.doc, input.x, input.y, input.pressure);
         }
@@ -840,13 +846,25 @@ impl ToolPlugin for PaintTool {
         }
     }
 
+    fn on_deactivate(&mut self, ctx: &mut ToolCtx) {
+        if let Some(stroke) = self.stroke.take() {
+            stroke.finish(ctx.doc);
+        }
+        // Nothing cleared this, so the circle from the last document
+        // reappeared the moment the brush was picked up again.
+        self.cursor = None;
+    }
+
     fn overlays(&self, _doc: &Document, state: &EditorState) -> Vec<Overlay> {
         match self.cursor {
             Some((cx, cy)) => {
+                // The dab's own radius: `size / 2 * pressure`, matching
+                // `Stroke::dab`. Drawing the unscaled half-size promised a
+                // stroke wider than the one a stylus would leave.
                 vec![Overlay::Circle {
                     cx,
                     cy,
-                    r: state.brush_size / 2.0,
+                    r: (state.brush_size / 2.0 * self.cursor_pressure.max(0.05)).max(0.5),
                 }]
             }
             None => Vec::new(),
@@ -1677,6 +1695,52 @@ mod tests {
         tool.on_cancel(&mut ctx);
         assert_eq!(pixel(&doc, 50, 50)[3], 0);
         assert!(!doc.history.can_undo());
+    }
+
+    #[test]
+    fn the_brush_cursor_tracks_pressure_and_clears_on_deactivate() {
+        // The circle was always `brush_size / 2` even though a dab is
+        // `size / 2 * pressure`, so the preview promised a wider stroke
+        // than a stylus would leave -- and nothing ever cleared it, so
+        // the circle from the last document reappeared as soon as the
+        // brush was picked up again.
+        let mut doc = doc_with_layer();
+        let mut state = EditorState {
+            brush_size: 40.0,
+            ..Default::default()
+        };
+        let mut tool = PaintTool::new(PaintMode::Brush);
+        let mut ctx = ToolCtx {
+            doc: &mut doc,
+            state: &mut state,
+        };
+
+        let light = PointerInput {
+            x: 20.0,
+            y: 20.0,
+            pressure: 0.25,
+            modifiers: Modifiers::default(),
+        };
+        tool.on_pointer_down(&mut ctx, light);
+        let overlays = tool.overlays(ctx.doc, ctx.state);
+        let Some(&Overlay::Circle { r, .. }) = overlays.first() else {
+            panic!("no brush cursor: {overlays:?}");
+        };
+        assert!((r - 5.0).abs() < 1e-3, "radius {r} ignores pressure");
+
+        tool.on_pointer_up(&mut ctx, light);
+        tool.on_pointer_move(&mut ctx, input(30.0, 30.0));
+        let overlays = tool.overlays(ctx.doc, ctx.state);
+        let Some(&Overlay::Circle { r, .. }) = overlays.first() else {
+            panic!("no brush cursor: {overlays:?}");
+        };
+        assert!((r - 20.0).abs() < 1e-3, "full pressure should be half size");
+
+        tool.on_deactivate(&mut ctx);
+        assert!(
+            tool.overlays(ctx.doc, ctx.state).is_empty(),
+            "a stale cursor survived the tool switch"
+        );
     }
 }
 

@@ -146,7 +146,14 @@ impl Session {
         ]
     }
 
-    fn handle_pos(&self, handle: Handle) -> (f32, f32) {
+    /// Where a handle sits, in document space.
+    ///
+    /// `zoom` only matters to the rotate handle, whose standoff from the
+    /// box is a fixed number of *screen* pixels: it was a fixed 24
+    /// document units, so at 800% it sat three screen pixels off the box
+    /// and at 10% it floated 240 screen pixels away, while `hit` had
+    /// always divided its radius by the zoom.
+    fn handle_pos(&self, handle: Handle, zoom: f32) -> (f32, f32) {
         let (ux, uy) = handle.anchor();
         let m = self.matrix();
         let r = self.base;
@@ -160,7 +167,8 @@ impl Session {
             let top = m.apply(r.left as f32 + r.width() as f32 * 0.5, r.top as f32);
             let (dx, dy) = (top.0 - sx, top.1 - sy);
             let len = (dx * dx + dy * dy).sqrt().max(1e-3);
-            (top.0 + dx / len * 24.0, top.1 + dy / len * 24.0)
+            let standoff = 24.0 / zoom.max(0.01);
+            (top.0 + dx / len * standoff, top.1 + dy / len * standoff)
         } else {
             (sx, sy)
         }
@@ -170,7 +178,7 @@ impl Session {
         // Handles are ~9 screen pixels; convert to document units.
         let r = (9.0 / zoom.max(0.01)).max(1.0);
         for handle in [Handle::Rotate].into_iter().chain(Handle::ALL) {
-            let (hx, hy) = self.handle_pos(handle);
+            let (hx, hy) = self.handle_pos(handle, zoom);
             if (x - hx).abs() <= r && (y - hy).abs() <= r {
                 return Some(handle);
             }
@@ -482,8 +490,9 @@ impl ToolPlugin for TransformTool {
             .inflated(session.base.width().max(session.base.height()));
         if session.mode == TransformMode::Selection {
             // Only the mask moves; the pixels are untouched, so this is one
-            // selection edit rather than a tile rewrite.
-            session.restore(ctx.doc);
+            // selection edit rather than a tile rewrite. (`restore` above
+            // has already run; calling it a second time here was
+            // idempotent but obscured the flow.)
             let canvas = ctx.doc.canvas_rect();
             let matrix = session.matrix();
             let base = session.original_selection.clone();
@@ -535,7 +544,7 @@ impl ToolPlugin for TransformTool {
         self.on_commit(ctx);
     }
 
-    fn overlays(&self, _doc: &Document, _state: &EditorState) -> Vec<Overlay> {
+    fn overlays(&self, _doc: &Document, state: &EditorState) -> Vec<Overlay> {
         let Some(session) = &self.session else {
             return Vec::new();
         };
@@ -548,15 +557,19 @@ impl ToolPlugin for TransformTool {
         }
         let r = 3.0;
         for handle in Handle::ALL {
-            let (x, y) = session.handle_pos(handle);
+            let (x, y) = session.handle_pos(handle, state.zoom);
+            // `as i32` truncates toward zero, so a handle shifts by a
+            // pixel once its coordinate goes negative -- on the
+            // off-canvas side, where the preview then disagrees with the
+            // floor/ceil used to commit the same gesture.
             out.push(Overlay::Rect(IntRect::new(
-                (x - r) as i32,
-                (y - r) as i32,
-                (x + r) as i32,
-                (y + r) as i32,
+                (x - r).floor() as i32,
+                (y - r).floor() as i32,
+                (x + r).ceil() as i32,
+                (y + r).ceil() as i32,
             )));
         }
-        let (rx, ry) = session.handle_pos(Handle::Rotate);
+        let (rx, ry) = session.handle_pos(Handle::Rotate, state.zoom);
         out.push(Overlay::Circle {
             cx: rx,
             cy: ry,
@@ -966,7 +979,7 @@ mod tests {
         };
         tool.on_activate(&mut ctx);
         let session = tool.session.as_ref().unwrap();
-        let (hx, hy) = session.handle_pos(Handle::Rotate);
+        let (hx, hy) = session.handle_pos(Handle::Rotate, 1.0);
         let (cx, cy) = session.pivot();
         tool.on_pointer_down(&mut ctx, input(hx, hy));
         // Drag the rotate handle a quarter turn around the centre.
@@ -1025,5 +1038,53 @@ mod tests {
         assert_eq!(px(&doc, 130, 130), [0, 128, 255, 255]);
         doc.undo();
         assert_eq!(px(&doc, 30, 30), [0, 128, 255, 255]);
+    }
+    /// The rotate handle's standoff is a fixed number of *screen* pixels.
+    /// It was a fixed 24 document units, so at 800% it sat three screen
+    /// pixels off the box and at 10% it floated 240 away -- while `hit`
+    /// had always divided its radius by the zoom.
+    #[test]
+    fn the_rotate_handle_keeps_its_screen_distance() {
+        let mut doc = doc_with_square();
+        let mut state = EditorState::default();
+        let mut tool = TransformTool::default();
+        let mut ctx = ToolCtx {
+            doc: &mut doc,
+            state: &mut state,
+        };
+        tool.on_activate(&mut ctx);
+        let session = tool.session.as_ref().unwrap();
+        let top = session.base.top as f32;
+
+        for zoom in [0.1f32, 1.0, 8.0] {
+            let (_, hy) = session.handle_pos(Handle::Rotate, zoom);
+            let screen = (top - hy) * zoom;
+            assert!(
+                (screen - 24.0).abs() < 0.5,
+                "at {zoom}x the handle stood {screen} screen pixels off the box"
+            );
+        }
+    }
+
+    /// And it stays grabbable at every zoom, which is the point.
+    #[test]
+    fn the_rotate_handle_is_hittable_at_any_zoom() {
+        let mut doc = doc_with_square();
+        let mut state = EditorState::default();
+        let mut tool = TransformTool::default();
+        let mut ctx = ToolCtx {
+            doc: &mut doc,
+            state: &mut state,
+        };
+        tool.on_activate(&mut ctx);
+        let session = tool.session.as_ref().unwrap();
+        for zoom in [0.1f32, 1.0, 8.0] {
+            let (hx, hy) = session.handle_pos(Handle::Rotate, zoom);
+            assert_eq!(
+                session.hit(hx, hy, zoom),
+                Some(Handle::Rotate),
+                "at {zoom}x"
+            );
+        }
     }
 }
