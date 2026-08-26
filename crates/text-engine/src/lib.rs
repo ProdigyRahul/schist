@@ -546,7 +546,19 @@ fn layout(spec: &TextSpec, face: &LoadedFace) -> Layout {
     // A face with GPOS kerning speaks through it alone; the legacy
     // `kern` table is only consulted when there is no GPOS to read.
     let gpos = GposKern::new(&face.data, face.index, spec.size);
-    let advance = |ch: char, prev: Option<char>| -> f32 {
+    // A tab is a stop, not a glyph. Four spaces wide, as every editor
+    // and word processor has settled on. The Type tool turns a Tab
+    // keypress into four spaces, but text arriving from a PSD's `PsTx`
+    // block can contain a real `\t`, and asking the font for the tab
+    // glyph's advance gave it a single ~11 px step -- so imported tabbed
+    // text did not line up in any column.
+    let tab_stop = (font.metrics(' ', spec.size).advance_width * 4.0).max(1.0);
+    // `pen` is the position along the line, measured from the line's own
+    // start, which is what a tab stop is relative to.
+    let advance = |ch: char, prev: Option<char>, pen: f32| -> f32 {
+        if ch == '\t' {
+            return ((pen / tab_stop).floor() + 1.0) * tab_stop - pen;
+        }
         let m = font.metrics(ch, spec.size);
         let kern = prev
             .and_then(|p| match &gpos {
@@ -569,7 +581,7 @@ fn layout(spec: &TextSpec, face: &LoadedFace) -> Layout {
             let mut word_width = 0.0;
             let mut p = prev;
             for ch in word.chars() {
-                word_width += advance(ch, p);
+                word_width += advance(ch, p, width + word_width);
                 p = Some(ch);
             }
             let wraps = spec
@@ -583,7 +595,7 @@ fn layout(spec: &TextSpec, face: &LoadedFace) -> Layout {
                 let mut p = None;
                 word_width = 0.0;
                 for ch in word.chars() {
-                    word_width += advance(ch, p);
+                    word_width += advance(ch, p, word_width);
                     p = Some(ch);
                 }
             }
@@ -598,17 +610,22 @@ fn layout(spec: &TextSpec, face: &LoadedFace) -> Layout {
     let mut placed = Vec::new();
     for (i, (line, width)) in lines.iter().enumerate() {
         let baseline = ascent + i as f32 * line_advance;
-        let mut x = match spec.align {
+        let start_x = match spec.align {
             Align::Left => 0.0,
             Align::Center => (max_width - width) / 2.0,
             Align::Right => max_width - width,
         };
         let mut prev: Option<char> = None;
+        let mut pen = 0.0f32;
         for ch in line.chars() {
             if !ch.is_whitespace() {
-                placed.push(PlacedGlyph { ch, x, baseline });
+                placed.push(PlacedGlyph {
+                    ch,
+                    x: start_x + pen,
+                    baseline,
+                });
             }
-            x += advance(ch, prev);
+            pen += advance(ch, prev, pen);
             prev = Some(ch);
         }
     }
@@ -852,5 +869,67 @@ mod tests {
         });
         assert!(r.is_some(), "should fall back to a system sans");
         assert!(!r.unwrap().is_empty());
+    }
+
+    /// A tab is a stop, not a glyph.
+    ///
+    /// `advance` had no `'\t'` case, so it asked the font for the tab
+    /// glyph's advance and got a single ~11 px step. The Type tool turns
+    /// a Tab keypress into four spaces, but text arriving from a PSD's
+    /// `PsTx` block can hold a real tab, and tabbed text imported that
+    /// way lined up in no column at all.
+    #[test]
+    fn a_tab_aligns_prefixes_that_share_a_stop() {
+        // Full stops are narrow enough that one, two and three of them
+        // all sit inside the first stop, which is where a tab is
+        // supposed to hide the difference.
+        let one = rasterize(&spec(".\tX")).expect("font loads");
+        let two = rasterize(&spec("..\tX")).expect("font loads");
+        let three = rasterize(&spec("...\tX")).expect("font loads");
+        assert!(
+            (one.layout_width - two.layout_width).abs() < 0.5
+                && (one.layout_width - three.layout_width).abs() < 0.5,
+            "the tab did not align the column: {} / {} / {}",
+            one.layout_width,
+            two.layout_width,
+            three.layout_width
+        );
+        // Without the tab they differ, so the test is measuring the tab
+        // rather than a font that renders every prefix the same width.
+        let plain_one = rasterize(&spec(".X")).expect("font loads");
+        let plain_three = rasterize(&spec("...X")).expect("font loads");
+        assert!(plain_three.layout_width > plain_one.layout_width + 1.0);
+    }
+
+    /// A prefix past the first stop reaches the next one, so the stops
+    /// are a grid rather than a fixed pad.
+    #[test]
+    fn a_long_prefix_reaches_the_next_stop() {
+        let short = rasterize(&spec(".\tX")).expect("font loads");
+        let long = rasterize(&spec("MMMMMM\tX")).expect("font loads");
+        assert!(
+            long.layout_width > short.layout_width + 1.0,
+            "{} did not clear the first stop ({})",
+            long.layout_width,
+            short.layout_width
+        );
+    }
+
+    /// Stops are measured from each line's own start, so a wide line does
+    /// not drag the line below it out of column.
+    #[test]
+    fn tab_stops_are_per_line() {
+        let alone = rasterize(&spec(".\tX")).expect("font loads");
+        let under = rasterize(&spec("MMMMMM\tX\n.\tX")).expect("font loads");
+        // The second line still sits on the first stop, so the block is
+        // exactly as wide as its widest line -- the long one.
+        let long = rasterize(&spec("MMMMMM\tX")).expect("font loads");
+        assert!(
+            (under.layout_width - long.layout_width).abs() < 0.5,
+            "the short line drifted: {} vs {}",
+            under.layout_width,
+            long.layout_width
+        );
+        assert!(long.layout_width > alone.layout_width);
     }
 }
