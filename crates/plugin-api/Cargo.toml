@@ -8,6 +8,7 @@ license.workspace = true
 schist-core.workspace = true
 schist-color.workspace = true
 anyhow.workspace = true
+log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true

@@ -1314,7 +1314,7 @@ impl Workspace {
         let bytes = codec.export(doc)?;
         // Write to a sibling temp file and rename, so an interrupted save
         // can't truncate the user's existing file.
-        let tmp = path.with_extension("schist-tmp");
+        let tmp = schist_core::temp_save_path(path);
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -5053,15 +5053,23 @@ impl Workspace {
     /// Enable or disable a third-party plugin.
     pub fn set_plugin_enabled(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
         let Some(dir) = schist_plugin_host_wasm::PluginManager::plugin_dir() else {
+            self.status = "No plugin directory to record the change in".into();
+            cx.notify();
             return;
         };
         self.plugins.set_enabled(&id, enabled, &dir);
-        self.status = format!(
-            "{} {} — restart to apply",
-            id,
-            if enabled { "enabled" } else { "disabled" }
-        )
-        .into();
+        // The write used to be `let _ = ...`, so a read-only or full
+        // config directory reported success and the choice was silently
+        // lost at the next launch.
+        self.status = match self.plugins.disabled_write_error() {
+            Some(err) => format!("{id}: could not record the change ({err})").into(),
+            None => format!(
+                "{} {} \u{2014} restart to apply",
+                id,
+                if enabled { "enabled" } else { "disabled" }
+            )
+            .into(),
+        };
         cx.notify();
     }
 

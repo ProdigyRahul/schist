@@ -562,12 +562,15 @@ impl Session {
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    // The parent has to exist already. `create_dir_all` here meant a path
+    // typo scattered empty directory trees instead of reporting that the
+    // destination does not exist.
     if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            bail!("{} is not a directory", parent.display());
         }
     }
-    let tmp: PathBuf = path.with_extension("schist-tmp");
+    let tmp: PathBuf = schist_core::temp_save_path(path);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())

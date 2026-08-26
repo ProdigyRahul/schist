@@ -29,15 +29,37 @@ impl PluginRegistry {
         self.tools.push(tool);
     }
 
+    /// Register a codec. A duplicate id is dropped with a warning rather
+    /// than shadowing the first: `codec_for` takes the first match, so a
+    /// second registration under the same id is dead weight that probes
+    /// on every file open and can never be selected. Tools already
+    /// assert on this.
     pub fn register_codec(&mut self, codec: Box<dyn CodecPlugin>) {
+        if self.codecs.iter().any(|c| c.id() == codec.id()) {
+            log::warn!("ignoring duplicate codec id {}", codec.id());
+            return;
+        }
         self.codecs.push(Arc::from(codec));
     }
 
     pub fn register_commands(&mut self, plugin: &dyn CommandPlugin) {
-        self.commands.extend(plugin.commands());
+        for command in plugin.commands() {
+            if self.commands.iter().any(|c| c.id == command.id) {
+                log::warn!("ignoring duplicate command id {}", command.id);
+                continue;
+            }
+            self.commands.push(command);
+        }
     }
 
+    /// Register a filter, dropping a duplicate id for the same reason as
+    /// codecs: the menu would show two identical entries and the lookup
+    /// would always reach the first.
     pub fn register_filter(&mut self, filter: Box<dyn FilterPlugin>) {
+        if self.filters.iter().any(|f| f.id() == filter.id()) {
+            log::warn!("ignoring duplicate filter id {}", filter.id());
+            return;
+        }
         self.filters.push(filter);
     }
 
@@ -93,4 +115,60 @@ impl PluginRegistry {
 pub trait PluginManifest {
     fn id(&self) -> &'static str;
     fn register(&self, registry: &mut PluginRegistry);
+}
+
+#[cfg(test)]
+mod duplicate_id_tests {
+    use super::*;
+    use crate::FilterValues;
+
+    struct Codec(&'static str);
+    impl CodecPlugin for Codec {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn name(&self) -> &'static str {
+            "Test"
+        }
+        fn extensions(&self) -> &'static [&'static str] {
+            &["tst"]
+        }
+        fn probe(&self, bytes: &[u8]) -> bool {
+            bytes.starts_with(b"TST")
+        }
+        fn import(&self, _bytes: &[u8]) -> anyhow::Result<schist_core::Document> {
+            anyhow::bail!("test codec")
+        }
+    }
+
+    struct Filter(&'static str);
+    impl FilterPlugin for Filter {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn name(&self) -> &'static str {
+            "Test"
+        }
+        fn apply(&self, _p: &mut [f32], _w: usize, _h: usize, _v: &FilterValues) {}
+    }
+
+    /// A second registration under the same id can never be selected --
+    /// `codec_for` and the filter lookup both take the first match -- so
+    /// it is dead weight that still probes on every file open, and shows
+    /// as a duplicate menu entry. Tools already assert on this.
+    #[test]
+    fn duplicate_ids_are_dropped_rather_than_shadowing() {
+        let mut reg = PluginRegistry::new();
+        reg.register_codec(Box::new(Codec("codec.test")));
+        reg.register_codec(Box::new(Codec("codec.test")));
+        assert_eq!(reg.codecs().filter(|c| c.id() == "codec.test").count(), 1);
+
+        reg.register_filter(Box::new(Filter("filter.test")));
+        reg.register_filter(Box::new(Filter("filter.test")));
+        assert_eq!(reg.filters().filter(|f| f.id() == "filter.test").count(), 1);
+
+        // A different id still registers.
+        reg.register_codec(Box::new(Codec("codec.other")));
+        assert_eq!(reg.codecs().count(), 2);
+    }
 }
