@@ -11,6 +11,12 @@ schist-codec-affinity.workspace = true
 anyhow.workspace = true
 log.workspace = true
 image.workspace = true
+libloading.workspace = true
+sha2 = "0.10"
 schist-color.workspace = true
 schist-colormgmt.workspace = true
 schist-compositor.workspace = true
+
+[dev-dependencies]
+crc32fast.workspace = true
+moxcms = "0.8"
