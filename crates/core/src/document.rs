@@ -182,6 +182,21 @@ impl Document {
         self.add_damage(all);
     }
 
+    /// Mark the document as having unsaved changes.
+    ///
+    /// `dirty` is otherwise set only by the edit machinery, so document
+    /// state that is mutated directly (guides, layer comps, saved
+    /// selections, notes, counts) never reached it: the tab closed with no
+    /// prompt and `autosave`, which filters on `dirty`, skipped the
+    /// document entirely.
+    ///
+    /// This is the minimum for not losing the work. Those lists still
+    /// belong in history; when they get their own `EditOp` the call here
+    /// becomes redundant rather than wrong.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     pub fn take_damage(&mut self) -> Vec<IntRect> {
         std::mem::take(&mut self.damage)
     }
@@ -199,12 +214,22 @@ impl Document {
         }
     }
 
+    /// The document on disk now matches this state: clear the dirty flag
+    /// and remember where in history that is, so undoing back here later
+    /// clears it again rather than leaving a saved file marked modified.
+    pub fn mark_saved(&mut self) {
+        self.dirty = false;
+        self.history.mark_saved();
+    }
+
     pub fn undo(&mut self) -> Option<String> {
         let edit = self.history.pop_undo()?;
         for op in edit.ops.iter().rev() {
             self.apply_op(op, Direction::Undo);
         }
-        self.dirty = true;
+        // Undoing back to the last save leaves the document matching
+        // what is on disk, so it is no longer dirty.
+        self.dirty = !self.history.at_saved();
         Some(edit.name)
     }
 
@@ -213,7 +238,7 @@ impl Document {
         for op in edit.ops.iter() {
             self.apply_op(op, Direction::Redo);
         }
-        self.dirty = true;
+        self.dirty = !self.history.at_saved();
         Some(edit.name)
     }
 
@@ -423,6 +448,14 @@ impl Document {
                 };
                 self.selection = (**target).clone();
                 self.revision += 1;
+            }
+            EditOp::ColorModeSet { before, after } => {
+                self.mode = if dir == Direction::Undo {
+                    *before
+                } else {
+                    *after
+                };
+                self.damage_all();
             }
         }
     }
@@ -780,6 +813,19 @@ impl<'a> EditBuilder<'a> {
                 after: mask.map(Box::new),
             });
         }
+    }
+
+    /// Change the document's colour mode as part of this edit.
+    pub fn set_color_mode(&mut self, mode: schist_color::ColorMode) {
+        if self.doc.mode == mode {
+            return;
+        }
+        let before = self.doc.mode;
+        self.doc.mode = mode;
+        self.ops.push(EditOp::ColorModeSet {
+            before,
+            after: mode,
+        });
     }
 
     /// Replace the selection via closure; captures before/after.
@@ -1172,5 +1218,133 @@ mod tests {
         assert!(!doc.selection.is_empty());
         doc.undo();
         assert!(doc.selection.is_empty());
+    }
+    #[test]
+    fn marking_dirty_is_what_a_close_prompt_and_autosave_key_off() {
+        // Guides, layer comps, saved selections, notes and counts are all
+        // mutated directly rather than through `begin_edit`, so nothing
+        // set `dirty` for them. The tab then closed without a prompt and
+        // autosave, which filters on `dirty`, skipped the document.
+        //
+        // This only pins the helper's contract; the call sites are
+        // covered where they live, in `tools-doc` and `commands-core`,
+        // because a test here cannot tell whether they call it.
+        let mut doc = Document::new("t", 32, 32, Depth::Eight);
+        assert!(!doc.dirty, "a fresh document is clean");
+
+        doc.guides.push(Guide {
+            horizontal: true,
+            position: 10.0,
+        });
+        assert!(!doc.dirty, "the push alone cannot set it");
+
+        doc.mark_dirty();
+        assert!(doc.dirty, "and this is what the call sites now do");
+    }
+
+    #[test]
+    fn damage_alone_does_not_imply_unsaved_changes() {
+        // `add_damage` bumps `revision` so the canvas repaints, which is
+        // why it looks like it should be enough and is not: a repaint is
+        // not an edit.
+        let mut doc = Document::new("t", 32, 32, Depth::Eight);
+        doc.damage_all();
+        assert!(doc.revision > 0, "repaint was requested");
+        assert!(!doc.dirty, "but nothing was actually changed");
+    }
+
+    #[test]
+    fn the_colour_mode_undoes_with_the_pixels() {
+        // Image > Mode set `doc.mode` outside the edit, so undo restored
+        // the colour and left the document still reporting greyscale,
+        // which is also what it would then have been saved as.
+        let mut doc = Document::new("t", 16, 16, Depth::Eight);
+        assert_eq!(doc.mode, schist_color::ColorMode::Rgb);
+
+        let mut edit = doc.begin_edit("Grayscale");
+        edit.set_color_mode(schist_color::ColorMode::Grayscale);
+        edit.commit();
+        assert_eq!(doc.mode, schist_color::ColorMode::Grayscale);
+
+        doc.undo();
+        assert_eq!(
+            doc.mode,
+            schist_color::ColorMode::Rgb,
+            "undo must restore the mode too"
+        );
+        doc.redo();
+        assert_eq!(doc.mode, schist_color::ColorMode::Grayscale);
+    }
+    #[test]
+    fn undoing_back_to_the_save_point_is_no_longer_dirty() {
+        // Undo used to set `dirty = true` unconditionally, so a document
+        // that had been saved and then edited stayed marked modified even
+        // after the edit was undone, and closing it still nagged.
+        let mut doc = Document::new("t", 8, 8, Depth::Eight);
+        let id = doc.push_layer(Layer::new_raster("l"));
+        doc.mark_saved();
+        assert!(!doc.dirty);
+
+        let mut edit = doc.begin_edit("Rename");
+        edit.change_props(id, |l| l.name = "renamed".into());
+        assert!(edit.commit());
+        assert!(doc.dirty);
+
+        doc.undo().unwrap();
+        assert!(!doc.dirty, "undo back to the save point left it dirty");
+
+        doc.redo().unwrap();
+        assert!(doc.dirty, "redoing past the save point is a modification");
+    }
+
+    #[test]
+    fn saving_after_an_edit_moves_the_save_point() {
+        let mut doc = Document::new("t", 8, 8, Depth::Eight);
+        let id = doc.push_layer(Layer::new_raster("l"));
+        let mut edit = doc.begin_edit("Rename");
+        edit.change_props(id, |l| l.name = "a".into());
+        edit.commit();
+        doc.mark_saved();
+
+        let mut edit = doc.begin_edit("Rename");
+        edit.change_props(id, |l| l.name = "b".into());
+        edit.commit();
+        doc.undo().unwrap();
+        assert!(!doc.dirty);
+        // Undoing *past* the save point is a change from what is on disk.
+        doc.undo().unwrap();
+        assert!(doc.dirty, "undoing past the save point must be dirty");
+    }
+    /// A save point that ends up in a discarded redo branch is
+    /// unreachable, so it must not go on matching the undo depth.
+    ///
+    /// Draw A, save, undo A, draw B (the redo branch holding the save
+    /// point is discarded), undo B, redo B: the depth matched again and
+    /// redo reported the document clean while it held B and the disk held
+    /// A. Behind the quit confirmation that loses B without asking.
+    #[test]
+    fn a_save_point_in_a_discarded_branch_does_not_come_back() {
+        let mut doc = Document::new("t", 8, 8, Depth::Eight);
+        let id = doc.push_layer(Layer::new_raster("l"));
+        let rename = |doc: &mut Document, to: &str| {
+            let mut e = doc.begin_edit("Rename");
+            e.change_props(id, |l| l.name = to.into());
+            assert!(e.commit());
+        };
+
+        rename(&mut doc, "a");
+        doc.mark_saved();
+        assert!(!doc.dirty);
+
+        doc.undo().unwrap();
+        rename(&mut doc, "b"); // discards the branch the save point was in
+        doc.undo().unwrap();
+        doc.redo().unwrap();
+
+        assert_eq!(doc.tree.find(id).unwrap().name, "b");
+        assert!(
+            doc.dirty,
+            "the document holds b and the disk holds a, so it is not saved"
+        );
     }
 }

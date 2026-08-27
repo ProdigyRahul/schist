@@ -7,14 +7,25 @@
 
 use crate::actions::*;
 use crate::workspace::Workspace;
-use gpui::{Context, KeyBinding, PathPromptOptions, Window};
+use gpui::{
+    Action, Context, DummyKeyboardMapper, KeyBinding, KeyBindingContextPredicate,
+    PathPromptOptions, Window,
+};
 use schist_plugin_api::PluginRegistry;
 use std::path::PathBuf;
 
-const CONTEXT: Option<&str> = Some("Workspace");
-/// Context for bindings without modifiers: suppressed while a tool is
-/// capturing typing (see `Workspace::tool_captures_keys`).
+/// Commands that act on the document. Suppressed while typing and while a
+/// modal is open: GPUI dispatches a matching binding *before* the
+/// element's `on_key_down`, and actions stop propagation by default, so a
+/// bound keystroke never reaches the text-entry code at all. Excluding the
+/// binding is the only way to let the keystroke through.
+const CONTEXT: Option<&str> = Some("Workspace && !text_entry && !modal");
+/// Context for bindings without modifiers, i.e. the single-letter tool
+/// shortcuts. `editable` is present only in the ordinary state.
 const TYPING_SAFE: Option<&str> = Some("Workspace && editable");
+/// Bindings that must stay live in every state. Escape is how you leave a
+/// text session or a dialog, so it cannot be suppressed by either.
+const ALWAYS: Option<&str> = Some("Workspace");
 
 fn translate(binding: &str) -> String {
     if cfg!(target_os = "macos") {
@@ -82,7 +93,7 @@ pub fn build_bindings(registry: &PluginRegistry) -> Vec<KeyBinding> {
         KeyBinding::new("]", BrushLarger, TYPING_SAFE),
         KeyBinding::new("x", SwapColors, TYPING_SAFE),
         KeyBinding::new("d", DefaultColors, TYPING_SAFE),
-        KeyBinding::new("escape", CancelGesture, CONTEXT),
+        KeyBinding::new("escape", CancelGesture, ALWAYS),
         KeyBinding::new("enter", CommitGesture, TYPING_SAFE),
         KeyBinding::new(
             &translate("cmd-t"),
@@ -147,24 +158,73 @@ pub fn build_bindings(registry: &PluginRegistry) -> Vec<KeyBinding> {
     // Format: { "<keystroke>": "command:<id>" | "tool:<id>" }
     if let Some(user) = load_user_keymap() {
         for (keystroke, target) in user {
-            if let Some(id) = target.strip_prefix("command:") {
-                bindings.push(KeyBinding::new(
-                    &keystroke,
-                    RunCommand { id: id.to_string() },
-                    CONTEXT,
-                ));
+            let action: Box<dyn Action> = if let Some(id) = target.strip_prefix("command:") {
+                Box::new(RunCommand { id: id.to_string() })
             } else if let Some(id) = target.strip_prefix("tool:") {
-                bindings.push(KeyBinding::new(
-                    &keystroke,
-                    ActivateTool { id: id.to_string() },
-                    CONTEXT,
-                ));
+                Box::new(ActivateTool { id: id.to_string() })
             } else {
                 log::warn!("keymap: unknown target {target:?} for {keystroke:?}");
+                continue;
+            };
+            // An unmodified key has to yield to whatever is capturing
+            // typing, exactly as the built-in tool shortcuts do. Binding
+            // an override in `CONTEXT` meant rebinding `e` to the eraser
+            // made the letter "e" unreachable inside a text layer, and
+            // since user bindings are appended last they win the tie-break
+            // against the built-in binding they were meant to replace.
+            let context = override_context(&keystroke);
+            match try_binding(&keystroke, action, context) {
+                Some(kb) => bindings.push(kb),
+                // `KeyBinding::new` panics on a keystroke gpui cannot
+                // parse, and "ctrl-page-up" or "cmd-arrow-left" are
+                // plausible things to write. One typo used to take the
+                // app down at launch, before any window existed to
+                // report it, leaving the user to find the file by hand.
+                None => log::error!(
+                    "keymap: cannot parse keystroke {keystroke:?} (bound to {target:?}); ignoring it"
+                ),
             }
         }
     }
     bindings
+}
+
+/// Which context a user override belongs in.
+///
+/// An unmodified key has to yield to whatever is capturing typing, as the
+/// built-in tool shortcuts do. Overrides were bound in `CONTEXT`
+/// unconditionally, so rebinding `e` to the eraser made the letter "e"
+/// unreachable inside a text layer -- and since user bindings are
+/// appended last they also win the tie-break against the built-in
+/// binding they were meant to replace, so the behaviour could not be
+/// restored without deleting the entry.
+fn override_context(keystroke: &str) -> Option<&'static str> {
+    if keystroke.contains('-') {
+        CONTEXT
+    } else {
+        TYPING_SAFE
+    }
+}
+
+/// `KeyBinding::new` without the panic on an unparseable keystroke.
+fn try_binding(
+    keystroke: &str,
+    action: Box<dyn Action>,
+    context: Option<&str>,
+) -> Option<KeyBinding> {
+    let predicate = match context {
+        Some(c) => Some(std::rc::Rc::new(KeyBindingContextPredicate::parse(c).ok()?)),
+        None => None,
+    };
+    KeyBinding::load(
+        keystroke,
+        action,
+        predicate,
+        false,
+        None,
+        &DummyKeyboardMapper,
+    )
+    .ok()
 }
 
 /// Where user keybinding overrides live.
@@ -264,10 +324,121 @@ pub fn save_file_dialog(ws: &mut Workspace, window: &mut Window, cx: &mut Contex
         .unwrap_or_else(|| "untitled.psd".into());
     let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
     cx.spawn_in(window, async move |this, cx| {
-        if let Ok(Ok(Some(path))) = rx.await {
-            this.update_in(cx, |ws, _window, cx| ws.save_file_as(path, cx))
-                .ok();
+        match rx.await {
+            Ok(Ok(Some(path))) => {
+                this.update_in(cx, |ws, _window, cx| ws.save_file_as(path, cx))
+                    .ok();
+            }
+            // Cancelled, or the prompt failed. Anything waiting on the
+            // save -- closing the tab, say -- has to be called off, or it
+            // would fire on some later unrelated save instead.
+            _ => {
+                this.update_in(cx, |ws, _window, _cx| ws.cancel_pending_save())
+                    .ok();
+            }
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{override_context, try_binding, ALWAYS, CONTEXT, TYPING_SAFE};
+    use crate::actions::ActivateTool;
+    use gpui::{KeyBindingContextPredicate, KeyContext};
+
+    /// Does a binding registered with `predicate` fire in `state`?
+    fn fires(predicate: Option<&str>, state: &str) -> bool {
+        let context = [KeyContext::parse(state).expect("context parses")];
+        KeyBindingContextPredicate::parse(predicate.unwrap())
+            .expect("predicate parses")
+            .eval_inner(&context, &context)
+    }
+
+    const ORDINARY: &str = "Workspace editable";
+    const TYPING: &str = "Workspace text_entry";
+    const MODAL: &str = "Workspace modal";
+
+    #[test]
+    fn document_commands_do_not_fire_while_typing_or_in_a_modal() {
+        // The reported bug: ctrl+a ran the canvas Select All while the
+        // caret was in a text layer, because every command was bound
+        // against plain "Workspace", which matched in all three states.
+        assert!(fires(CONTEXT, ORDINARY), "must work normally");
+        assert!(!fires(CONTEXT, TYPING), "ctrl+a must reach the text");
+        assert!(
+            !fires(CONTEXT, MODAL),
+            "ctrl+z must not undo under a dialog"
+        );
+    }
+
+    #[test]
+    fn single_letter_shortcuts_stay_suppressed_while_typing() {
+        // These were already correct; the fix must not regress them.
+        assert!(fires(TYPING_SAFE, ORDINARY));
+        assert!(!fires(TYPING_SAFE, TYPING));
+        assert!(!fires(TYPING_SAFE, MODAL));
+    }
+
+    #[test]
+    fn escape_survives_every_state() {
+        // Escape is the way out of a text session and out of a dialog, so
+        // suppressing it would trap the user in both.
+        assert!(fires(ALWAYS, ORDINARY));
+        assert!(fires(ALWAYS, TYPING));
+        assert!(fires(ALWAYS, MODAL));
+    }
+
+    #[test]
+    fn the_three_states_are_mutually_exclusive() {
+        // Exactly one of the three tokens is present at a time, which is
+        // what lets a predicate name a state by excluding the others.
+        for (state, expected) in [
+            (ORDINARY, ["editable"].as_slice()),
+            (TYPING, ["text_entry"].as_slice()),
+            (MODAL, ["modal"].as_slice()),
+        ] {
+            for token in ["editable", "text_entry", "modal"] {
+                let present = fires(Some(token), state);
+                assert_eq!(
+                    present,
+                    expected.contains(&token),
+                    "{state:?} should{} carry {token:?}",
+                    if expected.contains(&token) {
+                        ""
+                    } else {
+                        " not"
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_user_keystroke_is_skipped_not_fatal() {
+        // `KeyBinding::new` panics on anything gpui cannot parse, and it
+        // runs before the window exists, so one typo in keymap.json took
+        // the app down at launch with a bare unwrap backtrace.
+        let tool = || {
+            Box::new(ActivateTool {
+                id: "eraser".into(),
+            })
+        };
+        assert!(try_binding("ctrl-s", tool(), CONTEXT).is_some());
+        // Two non-modifier components: gpui rejects these.
+        for bad in ["ctrl-s-a", "ctrl-page-up", "cmd-arrow-left", "alt-num-1"] {
+            assert!(
+                try_binding(bad, tool(), CONTEXT).is_none(),
+                "{bad} should be declined, not panic"
+            );
+        }
+    }
+
+    #[test]
+    fn unmodified_overrides_yield_to_typing() {
+        assert_eq!(override_context("e"), TYPING_SAFE);
+        assert_eq!(override_context("5"), TYPING_SAFE);
+        assert_eq!(override_context("ctrl-e"), CONTEXT);
+        assert_eq!(override_context("cmd-shift-s"), CONTEXT);
+    }
 }

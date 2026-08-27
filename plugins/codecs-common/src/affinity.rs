@@ -80,7 +80,7 @@ impl CodecPlugin for AffinityCodec {
                     reference.visible = false;
                     doc.tree.layers.insert(0, reference);
                     doc.damage_all();
-                    doc.dirty = false;
+                    doc.mark_saved();
                 }
                 return Ok(doc);
             }
@@ -95,9 +95,7 @@ impl CodecPlugin for AffinityCodec {
     }
 
     fn can_export(&self) -> bool {
-        // Export is broken; hidden from every export surface until
-        // https://github.com/IAmJSD/schist/issues/40 is fixed.
-        false
+        true
     }
 
     fn export(&self, doc: &Document) -> anyhow::Result<Vec<u8>> {
@@ -190,7 +188,7 @@ impl AffinityCodec {
             );
             doc.push_layer(layer);
             doc.damage_all();
-            doc.dirty = false;
+            doc.mark_saved();
             return Ok(doc);
         }
         anyhow::bail!(
