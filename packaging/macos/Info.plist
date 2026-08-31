@@ -5,8 +5,8 @@
     <key>CFBundleName</key><string>Schist</string>
     <key>CFBundleDisplayName</key><string>Schist</string>
     <key>CFBundleIdentifier</key><string>place.astrid.schist</string>
-    <key>CFBundleVersion</key><string>0.5.0</string>
-    <key>CFBundleShortVersionString</key><string>0.5.0</string>
+    <key>CFBundleVersion</key><string>0.6.0</string>
+    <key>CFBundleShortVersionString</key><string>0.6.0</string>
     <key>CFBundleExecutable</key><string>schist</string>
     <key>CFBundleIconFile</key><string>schist</string>
     <key>CFBundlePackageType</key><string>APPL</string>
@@ -116,6 +116,8 @@
                 <string>public.jpeg</string>
                 <string>public.tiff</string>
                 <string>org.webmproject.webp</string>
+                <string>public.heic</string>
+                <string>public.heif</string>
             </array>
         </dict>
     </array>

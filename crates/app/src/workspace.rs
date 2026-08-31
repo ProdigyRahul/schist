@@ -8,7 +8,7 @@ use crate::actions::*;
 use crate::keymap;
 use crate::panels;
 use gpui::{
-    canvas, div, point, px, size, App, Bounds, Context, FocusHandle, Focusable,
+    canvas, div, point, px, size, App, Bounds, Context, ExternalPaths, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement as _, PathBuilder, PinchEvent, Pixels, Point, Render, RenderImage,
     ScrollWheelEvent, SharedString, Styled as _, TouchPhase, Window,
@@ -164,6 +164,9 @@ pub struct Workspace {
     /// Font families currently downloading, so a second click does not
     /// start a second download.
     pub font_downloads: Vec<String>,
+    /// Whether the HEIC decode library is currently downloading, so a
+    /// second HEIC open does not start a second download.
+    pub heif_download: bool,
     /// Families already offered this session. Opening three documents
     /// that all want the same missing font should ask once, not thrice.
     pub fonts_offered: std::collections::HashSet<String>,
@@ -198,6 +201,10 @@ pub struct Workspace {
     pub context_menu: Option<ContextMenu>,
     /// The open modal dialog, if any.
     pub modal: Option<Modal>,
+    /// A quit is waiting on the unsaved-changes prompts. Set by
+    /// `request_quit`, cleared by `cancel_quit`, and consumed by
+    /// `resume_quit` once every tab is clean.
+    pending_quit: bool,
     /// Dialogs suspended underneath `modal`, innermost last. Only the
     /// Color Picker stacks: it opens on top of a dialog that owns a colour
     /// swatch, and closing it puts that dialog back exactly as it was.
@@ -607,6 +614,13 @@ pub enum Modal {
     },
     /// "Save changes before closing?" for the active tab.
     ConfirmCloseTab,
+    /// An image file dropped on the window while a document is open:
+    /// open it in its own tab, or place it as a new layer?
+    DropImage { path: PathBuf },
+    /// A HEIC file needs the libheif decoder and this machine has none:
+    /// offer to download it (with its LGPL license texts), then retry
+    /// opening `path`.
+    HeifSupport { path: PathBuf },
     /// The third-party plugin manager.
     PluginManager,
     /// Neural Filters model downloads.
@@ -775,6 +789,7 @@ impl Workspace {
             rotation: 0.0,
             model_downloads: Vec::new(),
             font_downloads: Vec::new(),
+            heif_download: false,
             fonts_offered: std::collections::HashSet::new(),
             ant_phase: 0,
             tool_has_overlay: false,
@@ -791,6 +806,7 @@ impl Workspace {
             tool_press: None,
             context_menu: None,
             modal: None,
+            pending_quit: false,
             modal_stack: Vec::new(),
             focused_field: None,
             field_buffer: String::new(),
@@ -820,9 +836,21 @@ impl Workspace {
             cx.background_executor()
                 .timer(std::time::Duration::from_secs(AUTOSAVE_SECS))
                 .await;
-            if this.update(cx, |ws, _| ws.autosave()).is_err() {
+            // Only the snapshot is taken on the main thread -- a handful
+            // of Arc bumps. The encode itself is a full PSD
+            // serialization, composite included, of every dirty tab; it
+            // used to run inside `Entity::update`, which is a hard hitch
+            // every thirty seconds on any large document, seconds of
+            // frozen ui mid-brushstroke.
+            let Ok(jobs) = this.update(cx, |ws, _| ws.autosave_jobs()) else {
                 break;
+            };
+            if jobs.is_empty() {
+                continue;
             }
+            cx.background_executor()
+                .spawn(async move { Workspace::write_autosave_jobs(jobs) })
+                .await;
         })
         .detach();
         // March the selection ants. Eight steps a second is what
@@ -1070,6 +1098,44 @@ impl Workspace {
         }
     }
 
+    /// Index of the first tab with unsaved changes, if any.
+    pub fn first_dirty_tab(&self) -> Option<usize> {
+        self.tab_strip().iter().position(|(_, dirty)| *dirty)
+    }
+
+    /// Begin quitting: prompt for each dirty tab, then quit.
+    ///
+    /// The window's `should_close` hook is synchronous and the prompt is
+    /// not, so quitting is vetoed and resumed here once the prompts are
+    /// answered.
+    pub fn request_quit(&mut self, cx: &mut Context<Self>) {
+        match self.first_dirty_tab() {
+            Some(index) => {
+                self.pending_quit = true;
+                self.select_tab(index, cx);
+                self.open_modal(Modal::ConfirmCloseTab, cx);
+            }
+            None => {
+                self.pending_quit = false;
+                cx.quit();
+            }
+        }
+    }
+
+    /// The user backed out of one of the prompts, so the quit is off.
+    pub fn cancel_quit(&mut self) {
+        self.pending_quit = false;
+    }
+
+    /// Continue a quit after a tab was saved or discarded: prompt for the
+    /// next dirty tab, or quit once none are left. A no-op when the user
+    /// is just closing a tab.
+    pub fn resume_quit(&mut self, cx: &mut Context<Self>) {
+        if self.pending_quit {
+            self.request_quit(cx);
+        }
+    }
+
     /// Close tab `index` outright, discarding any unsaved changes. Closing
     /// the last tab leaves an empty workspace.
     pub fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1114,12 +1180,13 @@ impl Workspace {
         cx.notify();
         let codecs = self.registry.shared_codecs();
         cx.spawn(async move |this, cx| {
+            let decode_path = path.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { decode_file(&codecs, &path) })
+                .spawn(async move { decode_file(&codecs, &decode_path) })
                 .await;
             this.update(cx, |ws, cx| {
-                ws.finish_load(result, cx);
+                ws.finish_load(path, result, cx);
                 cx.notify();
             })
             .ok();
@@ -1127,7 +1194,12 @@ impl Workspace {
         .detach();
     }
 
-    fn finish_load(&mut self, result: anyhow::Result<Document>, cx: &mut Context<Self>) {
+    fn finish_load(
+        &mut self,
+        path: PathBuf,
+        result: anyhow::Result<Document>,
+        cx: &mut Context<Self>,
+    ) {
         match result {
             Ok(doc) => {
                 self.status = match &doc.path {
@@ -1137,11 +1209,179 @@ impl Workspace {
                 self.install_document(doc);
                 self.offer_missing_fonts(cx);
             }
+            // A HEIC on a machine with no libheif — or a libheif with
+            // no HEVC decoder, as stock Ubuntu ships: downloading the
+            // managed build fixes both, so offer that instead of failing.
+            Err(err)
+                if schist_codecs_common::heif::download_would_help(&err)
+                    && schist_codecs_common::heif::managed_library().is_some()
+                    && self.modal.is_none() =>
+            {
+                self.status = "HEIC support is not installed".into();
+                self.open_modal(Modal::HeifSupport { path }, cx);
+            }
             Err(err) => {
                 log::error!("open failed: {err:#}");
                 self.status = format!("Open failed: {err}").into();
             }
         }
+    }
+
+    /// Download the pinned decode-only libheif build and its license
+    /// texts — only ever called from the consent dialog — then retry
+    /// opening the file that needed it.
+    pub fn download_heif_support(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.heif_download {
+            return;
+        }
+        let Some(managed) = schist_codecs_common::heif::managed_library() else {
+            return;
+        };
+        self.heif_download = true;
+        self.status = format!(
+            "Downloading HEIC support (libheif {})\u{2026}",
+            managed.version
+        )
+        .into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let installed = cx
+                .background_executor()
+                .spawn(async move {
+                    // License texts first: the library must not land
+                    // without them.
+                    for file in managed.licenses.iter().chain([&managed.library]) {
+                        let bytes = fetch_model(file.url)
+                            .map_err(|e| anyhow::anyhow!("{}: {e}", file.name))?;
+                        schist_codecs_common::heif::install(file, &bytes)?;
+                    }
+                    anyhow::Ok(())
+                })
+                .await;
+            this.update(cx, |ws, cx| {
+                ws.heif_download = false;
+                match installed {
+                    Ok(()) => ws.load_file(path, cx),
+                    Err(err) => {
+                        log::error!("HEIC support download failed: {err:#}");
+                        ws.status = format!("HEIC support download failed: {err}").into();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Files dragged from the OS and dropped anywhere in the window.
+    ///
+    /// Layered documents always open in their own tabs. A flat image
+    /// dropped onto an open document could mean "open it" or "place it",
+    /// so that case asks; with several files, or nothing to place into,
+    /// everything just opens.
+    pub fn handle_dropped_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if let [path] = paths.as_slice() {
+            if self.doc.is_some() && self.is_flat_image(path) {
+                self.open_modal(Modal::DropImage { path: path.clone() }, cx);
+                return;
+            }
+        }
+        for path in paths {
+            self.load_file(path, cx);
+        }
+    }
+
+    /// True when the extension belongs to a single-layer image format.
+    /// Layered formats never make sense as one new layer.
+    fn is_flat_image(&self, path: &std::path::Path) -> bool {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return false;
+        };
+        let ext = ext.to_ascii_lowercase();
+        self.registry
+            .codecs()
+            .find(|c| c.extensions().contains(&ext.as_str()))
+            .is_some_and(|c| !matches!(c.id(), "codec.psd" | "codec.affinity"))
+    }
+
+    /// Decode `path` off the UI thread and insert it into the current
+    /// document as a new raster layer, centered like a paste.
+    pub fn place_image_as_layer(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.status = format!("Placing {}\u{2026}", path.display()).into();
+        cx.notify();
+        let codecs = self.registry.shared_codecs();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let doc = decode_file(&codecs, &path)?;
+                    // The codec hands back a document; the layer wants
+                    // pixels, so flatten it.
+                    let rect = doc.canvas_rect();
+                    let rgba = schist_compositor::composite_region_rgba8(&doc, rect);
+                    anyhow::Ok((path, doc.title, rect, rgba))
+                })
+                .await;
+            this.update(cx, |ws, cx| {
+                ws.finish_place(result, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_place(
+        &mut self,
+        result: anyhow::Result<(PathBuf, String, IntRect, Vec<u8>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let (path, title, rect, rgba) = match result {
+            Ok(r) => r,
+            Err(err) => {
+                log::error!("place failed: {err:#}");
+                self.status = format!("Place failed: {err}").into();
+                return;
+            }
+        };
+        if self.doc.is_none() {
+            // The tab closed while the file decoded; open it in its own
+            // tab instead of dropping it on the floor.
+            self.load_file(path, cx);
+            return;
+        }
+        let doc = self.doc.as_mut().unwrap();
+        // Centered, like paste with no selection.
+        let cw = doc.width as i32;
+        let ch = doc.height as i32;
+        let dest = IntRect::from_xywh(
+            (cw - rect.width()) / 2,
+            (ch - rect.height()) / 2,
+            rect.width() as u32,
+            rect.height() as u32,
+        );
+        let mut layer = Layer::new_raster(title.clone());
+        blit_rgba8(
+            &mut layer.as_raster_mut().unwrap().tiles,
+            doc.depth,
+            dest,
+            &rgba,
+        );
+        let id = layer.id;
+        let insert_at = match doc.active_layer.and_then(|a| doc.tree.path_of(a)) {
+            Some(mut p) => {
+                *p.0.last_mut().unwrap() += 1;
+                p
+            }
+            None => schist_core::LayerPath(vec![doc.tree.layers.len()]),
+        };
+        let mut edit = doc.begin_edit("Place Image");
+        edit.insert_layer(insert_at, layer);
+        edit.commit();
+        doc.active_layer = Some(id);
+        self.status = format!("Placed {title}").into();
+        self.after_change(cx);
     }
 
     /// Serialize the document to `path`, choosing the codec by extension.
@@ -1201,9 +1441,7 @@ impl Workspace {
         let bytes = codec.export(doc)?;
         // Write to a sibling temp file and rename, so an interrupted save
         // can't truncate the user's existing file.
-        let tmp = path.with_extension("schist-tmp");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, path)?;
+        schist_core::write_atomically(path, &bytes)?;
         Ok(())
     }
 
@@ -1217,12 +1455,18 @@ impl Workspace {
     /// One snapshot file per open document, so every dirty tab survives a
     /// crash, not just the frontmost one.
     fn recovery_path(&self, id: schist_core::DocumentId) -> Option<PathBuf> {
+        Self::recovery_path_for(id)
+    }
+
+    fn recovery_path_for(id: schist_core::DocumentId) -> Option<PathBuf> {
         Some(Self::recovery_dir()?.join(format!("session-{}-{}.psd", std::process::id(), id.0)))
     }
 
-    /// Write a recovery snapshot for every document with unsaved changes.
-    /// Returns true when at least one snapshot was written.
-    pub fn autosave(&mut self) -> bool {
+    /// What the next autosave has to write: one cheap snapshot per dirty
+    /// document, paired with where it goes.
+    ///
+    /// Taken on the main thread; encoded and written off it.
+    pub fn autosave_jobs(&mut self) -> Vec<(Document, PathBuf)> {
         let dirty: Vec<&Document> = self
             .doc
             .iter()
@@ -1230,22 +1474,33 @@ impl Workspace {
             .filter(|d| d.dirty)
             .collect();
         if dirty.is_empty() {
-            return false;
+            return Vec::new();
         }
         let Some(dir) = Self::recovery_dir() else {
-            return false;
+            return Vec::new();
         };
         if let Err(err) = std::fs::create_dir_all(&dir) {
             log::warn!("autosave: cannot create {dir:?}: {err}");
-            return false;
+            return Vec::new();
         }
+        dirty
+            .into_iter()
+            .filter_map(|doc| Some((doc.snapshot_for_export(), Self::recovery_path_for(doc.id)?)))
+            .collect()
+    }
+
+    /// Encode and write the snapshots. Runs on a background thread, so it
+    /// uses the codec directly rather than the registry the workspace
+    /// owns; recovery snapshots are always PSD.
+    pub fn write_autosave_jobs(jobs: Vec<(Document, PathBuf)>) -> bool {
         let mut wrote = false;
-        for doc in dirty {
-            let Some(path) = self.recovery_path(doc.id) else {
-                continue;
-            };
-            match self.write_doc_to(doc, &path) {
-                Ok(()) => {
+        for (doc, path) in jobs {
+            match schist_codec_psd::write_psd(&doc) {
+                Ok(bytes) => {
+                    if let Err(err) = schist_core::write_atomically(&path, &bytes) {
+                        log::warn!("autosave failed: {err:#}");
+                        continue;
+                    }
                     log::debug!("autosaved recovery snapshot to {path:?}");
                     wrote = true;
                 }
@@ -2295,7 +2550,9 @@ impl Workspace {
             let Some(filter) = self.registry.filters().find(|f| f.id() == entry.id) else {
                 continue;
             };
-            filter.apply(buf, w, h, &entry.values);
+            if let Err(err) = filter.try_apply(buf, w, h, &entry.values) {
+                log::warn!("gallery filter {} failed: {err}", entry.id);
+            }
         }
     }
 
@@ -2364,6 +2621,7 @@ impl Workspace {
         let mut comp = schist_core::LayerComp::new(format!("Layer Comp {n}"));
         comp.states = states;
         doc.layer_comps.push(comp);
+        doc.mark_dirty();
         self.status = "Layer comp captured".into();
         cx.notify();
     }
@@ -2400,6 +2658,7 @@ impl Workspace {
         if let Some(doc) = self.doc.as_mut() {
             if index < doc.layer_comps.len() {
                 doc.layer_comps.remove(index);
+                doc.mark_dirty();
             }
         }
         cx.notify();
@@ -2811,6 +3070,11 @@ impl Workspace {
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // An OS file drag reaches here as synthetic left-button moves;
+        // they must not feed the active tool.
+        if cx.has_active_drag() {
+            return;
+        }
         if self.dragging_guide() {
             let horizontal = self.dragging_guide.map(|g| g.horizontal).unwrap_or(false);
             let position = if horizontal {
@@ -3794,6 +4058,8 @@ impl Workspace {
             // These dialogs have no typed fields.
             Modal::DestructiveAdjustment { .. }
             | Modal::ConfirmCloseTab
+            | Modal::DropImage { .. }
+            | Modal::HeifSupport { .. }
             | Modal::ModelManager
             | Modal::FilterGallery { .. }
             | Modal::Stroke { .. }
@@ -4323,6 +4589,7 @@ impl Workspace {
             };
             if guide.position >= 0.0 && guide.position <= limit {
                 doc.guides.push(guide);
+                doc.mark_dirty();
                 doc.damage_all();
             }
         }
@@ -4336,8 +4603,14 @@ impl Workspace {
     /// Remove every guide.
     pub fn clear_guides(&mut self, cx: &mut Context<Self>) {
         if let Some(doc) = self.doc.as_mut() {
-            doc.guides.clear();
-            doc.damage_all();
+            // Clearing an already-empty list changes nothing, and marking
+            // dirty for it means a spurious close prompt plus a full
+            // export every 30 seconds from autosave until the next save.
+            if !doc.guides.is_empty() {
+                doc.guides.clear();
+                doc.mark_dirty();
+                doc.damage_all();
+            }
         }
         self.status = "Guides cleared".into();
         self.after_change(cx);
@@ -4656,7 +4929,10 @@ impl Workspace {
             let Some(filter) = self.registry.filters().find(|f| f.id() == id) else {
                 return;
             };
-            filter.apply(&mut buf, w, h, values);
+            if let Err(err) = filter.try_apply(&mut buf, w, h, values) {
+                self.status = format!("{} failed: {err}", filter.name()).into();
+                return;
+            }
         }
         self.write_region(
             preview.layer,
@@ -4722,13 +4998,24 @@ impl Workspace {
             return;
         };
         let mut buf = original.clone();
-        let filter = self.registry.filters().find(|f| f.id() == id).unwrap();
-        filter.apply(
+        let Some(filter) = self.registry.filters().find(|f| f.id() == id) else {
+            self.status = "Filter went away".into();
+            return;
+        };
+        // A sandboxed filter can trap or run out of fuel. Recording the
+        // edit anyway put the filter's name in the status bar, marked the
+        // document unsaved and added a no-op history step for pixels that
+        // never changed.
+        if let Err(err) = filter.try_apply(
             &mut buf,
             region.width() as usize,
             region.height() as usize,
             values,
-        );
+        ) {
+            self.status = format!("{name} failed: {err}").into();
+            cx.notify();
+            return;
+        }
         self.write_region(layer_id, region, &original, &buf, &name, true);
         self.status = name.into();
         self.after_change(cx);
@@ -4934,15 +5221,23 @@ impl Workspace {
     /// Enable or disable a third-party plugin.
     pub fn set_plugin_enabled(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
         let Some(dir) = schist_plugin_host_wasm::PluginManager::plugin_dir() else {
+            self.status = "No plugin directory to record the change in".into();
+            cx.notify();
             return;
         };
         self.plugins.set_enabled(&id, enabled, &dir);
-        self.status = format!(
-            "{} {} — restart to apply",
-            id,
-            if enabled { "enabled" } else { "disabled" }
-        )
-        .into();
+        // The write was a discarded `let _`, so a read-only or full config
+        // directory reported success and the choice was gone at the next
+        // launch.
+        self.status = match self.plugins.disabled_write_error() {
+            Some(err) => format!("{id}: could not record the change ({err})").into(),
+            None => format!(
+                "{} {} \u{2014} restart to apply",
+                id,
+                if enabled { "enabled" } else { "disabled" }
+            )
+            .into(),
+        };
         cx.notify();
     }
 
@@ -6052,8 +6347,17 @@ impl Render for Workspace {
         if let Some((id, enabled)) = self.pending_plugin_toggle.take() {
             self.set_plugin_enabled(id, enabled, cx);
         }
-        let captures_keys =
-            self.tool_captures_keys() || self.modal.is_some() || self.layer_rename.is_some();
+        // Three mutually exclusive input states. A single "is something
+        // capturing keys" flag was not enough: the document commands were
+        // bound against plain "Workspace", which matches in every state, so
+        // only the unmodified single-letter bindings were ever suppressed.
+        let key_context = if self.modal.is_some() {
+            "Workspace modal"
+        } else if self.tool_captures_keys() || self.layer_rename.is_some() {
+            "Workspace text_entry"
+        } else {
+            "Workspace editable"
+        };
         let chrome = self.screen_mode == ScreenMode::Standard;
         // On macOS the menus live in the system bar, not in the window.
         crate::native_menu::sync(self, cx);
@@ -6071,11 +6375,11 @@ impl Render for Workspace {
             // While a tool is capturing typing the context loses "editable",
             // which is what single-letter shortcuts are bound against — so
             // letters reach the tool instead of switching tools.
-            .key_context(if captures_keys {
-                "Workspace"
-            } else {
-                "Workspace editable"
-            })
+            .key_context(key_context)
+            // Files dragged in from the OS: anywhere in the window works.
+            .on_drop(cx.listener(|ws, paths: &ExternalPaths, _w, cx| {
+                ws.handle_dropped_paths(paths.paths().to_vec(), cx);
+            }))
             .on_action(cx.listener(|ws, action: &RunCommand, _w, cx| {
                 ws.run_command(&action.id.clone(), cx);
             }))
@@ -6536,6 +6840,22 @@ mod tests {
     #[test]
     fn no_snapshots_is_not_an_error() {
         assert!(Workspace::rank_snapshots(Vec::new(), 1).is_empty());
+    }
+
+    #[test]
+    fn first_dirty_tab_picks_the_earliest_unsaved_one() {
+        // `first_dirty_tab` is what decides whether quitting prompts, so
+        // its contract is worth pinning even though the tab strip itself
+        // needs a running window.
+        let strip: Vec<(&str, bool)> =
+            vec![("clean", false), ("also clean", false), ("dirty", true)];
+        assert_eq!(strip.iter().position(|(_, d)| *d), Some(2));
+
+        let strip: Vec<(&str, bool)> = vec![("clean", false), ("clean too", false)];
+        assert_eq!(strip.iter().position(|(_, d)| *d), None);
+
+        let strip: Vec<(&str, bool)> = vec![("dirty", true), ("dirty", true)];
+        assert_eq!(strip.iter().position(|(_, d)| *d), Some(0));
     }
 
     use super::*;
