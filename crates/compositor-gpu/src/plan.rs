@@ -280,8 +280,12 @@ fn emit_layers<'a>(
                     op.opacity = layer.opacity * content_alpha(layer);
                 }
                 LayerKind::Group(g) => {
+                    // Mirrors the CPU compositor: fill opacity is part of
+                    // the pass-through test, or a group at fill 50% would
+                    // render its children at full strength.
                     let pass_through = layer.blend == BlendMode::PassThrough
                         && layer.opacity >= 1.0
+                        && content_alpha(layer) >= 1.0
                         && layer.mask.is_none();
                     if pass_through {
                         emit_layers(&g.children, plan, depth)?;
@@ -297,7 +301,7 @@ fn emit_layers<'a>(
                         let mask = plan.mask_ref(layer);
                         let op = plan.op(OP_BLEND);
                         op.mode = mode_id(mode);
-                        op.opacity = layer.opacity;
+                        op.opacity = layer.opacity * content_alpha(layer);
                         op.mask = mask;
                     }
                 }
@@ -425,6 +429,10 @@ fn emit_adjust<'a>(
 /// the shader has no branch for.
 fn direct_coeffs(params: &Params) -> Option<(u32, [f32; DIRECT_STRIDE])> {
     match params {
+        // Per-range HSL tweaks need six trapezoids' worth of
+        // coefficients, which don't fit the direct row — those
+        // adjustments composite on the CPU.
+        Params::HueSaturation { ranges, .. } if !ranges.is_empty() => None,
         Params::HueSaturation {
             hue,
             saturation,
@@ -432,6 +440,7 @@ fn direct_coeffs(params: &Params) -> Option<(u32, [f32; DIRECT_STRIDE])> {
             colorize,
             lightness_desaturates,
             reciprocal_saturation,
+            ranges: _,
         } => Some((
             D_HUE_SATURATION,
             [
