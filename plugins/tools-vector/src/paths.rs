@@ -116,6 +116,17 @@ pub fn store(doc: &mut Document, path: VectorPath) {
     doc.active_path = Some(doc.paths.len() - 1);
 }
 
+/// The opposite handle for a smooth point: `dragged`'s direction reversed,
+/// at `other`'s own length.
+fn mirror(dragged: (f32, f32), other: (f32, f32)) -> (f32, f32) {
+    let len = (dragged.0 * dragged.0 + dragged.1 * dragged.1).sqrt();
+    if len <= 1e-6 {
+        return other;
+    }
+    let keep = (other.0 * other.0 + other.1 * other.1).sqrt();
+    (-dragged.0 / len * keep, -dragged.1 / len * keep)
+}
+
 // ------------------------------------------------------ path selection
 
 /// Whether an arrow moves whole paths or individual anchors.
@@ -164,6 +175,14 @@ impl ToolPlugin for PathSelectTool {
             ArrowKind::Direct => "Direct Selection",
         }
     }
+    fn description(&self) -> &'static str {
+        match self.kind {
+            ArrowKind::Path => "Click a path to select it, and drag to move the whole path.",
+            ArrowKind::Direct => {
+                "Drag an individual anchor point or its handles to reshape the path around it."
+            }
+        }
+    }
     fn icon(&self) -> &'static str {
         match self.kind {
             ArrowKind::Path => "path-select",
@@ -187,8 +206,12 @@ impl ToolPlugin for PathSelectTool {
                 .paths
                 .iter()
                 .position(|p| p.hit_anchor(input.x, input.y, r * 4.0).is_some());
-            if hit.is_some() {
-                ctx.doc.active_path = hit;
+            match hit {
+                Some(_) => ctx.doc.active_path = hit,
+                // A click that hit nothing must not drag whatever path
+                // happened to be active, possibly off-screen or belonging
+                // to a shape layer.
+                None => self.last = None,
             }
             return;
         }
@@ -244,16 +267,23 @@ impl ToolPlugin for PathSelectTool {
                             Grab::Point => *an = an.translated(dx, dy),
                             // Dragging one handle swings the other with it,
                             // which is what keeps a smooth point smooth.
+                            // A smooth point mirrors the opposite
+                            // handle's *direction* and keeps its own
+                            // length. Negating outright forced both to the
+                            // same magnitude, so dragging one handle
+                            // rescaled the curve on the other side and
+                            // asymmetric smooth points could not exist.
+                            // Alt breaks the pair into a corner point.
                             Grab::HandleOut => {
                                 an.handle_out = (an.handle_out.0 + dx, an.handle_out.1 + dy);
-                                if an.handle_in != (0.0, 0.0) {
-                                    an.handle_in = (-an.handle_out.0, -an.handle_out.1);
+                                if !input.modifiers.alt && an.handle_in != (0.0, 0.0) {
+                                    an.handle_in = mirror(an.handle_out, an.handle_in);
                                 }
                             }
                             Grab::HandleIn => {
                                 an.handle_in = (an.handle_in.0 + dx, an.handle_in.1 + dy);
-                                if an.handle_out != (0.0, 0.0) {
-                                    an.handle_out = (-an.handle_in.0, -an.handle_in.1);
+                                if !input.modifiers.alt && an.handle_out != (0.0, 0.0) {
+                                    an.handle_out = mirror(an.handle_in, an.handle_out);
                                 }
                             }
                         }
@@ -366,6 +396,13 @@ impl ToolPlugin for FreeformPenTool {
             "Curvature Pen"
         } else {
             "Freeform Pen"
+        }
+    }
+    fn description(&self) -> &'static str {
+        if self.curvature {
+            "Click a series of points and the path is curved smoothly through them."
+        } else {
+            "Drag a freehand line and it is fitted to a path, as loosely as the Fit option says."
         }
     }
     fn icon(&self) -> &'static str {
@@ -550,6 +587,7 @@ pub struct CustomShapeTool {
     anchor: Option<(f32, f32)>,
     current: Option<(f32, f32)>,
     keep_ratio: bool,
+    preview: crate::DragPreview,
 }
 
 impl CustomShapeTool {
@@ -559,7 +597,45 @@ impl CustomShapeTool {
             anchor: None,
             current: None,
             keep_ratio: false,
+            preview: crate::DragPreview::default(),
         }
+    }
+
+    /// The layer this drag would commit, or `None` while it is still a
+    /// click.
+    fn build_layer(
+        &self,
+        doc: &Document,
+        from: (f32, f32),
+        to: (f32, f32),
+        colour: schist_color::Rgba,
+    ) -> Option<schist_core::Layer> {
+        if (to.0 - from.0).abs() < 2.0 && (to.1 - from.1).abs() < 2.0 {
+            return None;
+        }
+        let outline = self.outline(from, to);
+        let mut b = PathBuilder::new();
+        b.move_to(outline[0].0, outline[0].1);
+        for p in &outline[1..] {
+            b.line_to(p.0, p.1);
+        }
+        b.close();
+        crate::rasterized_layer(
+            doc,
+            &b.build(0.25),
+            colour,
+            schist_vector::FillRule::NonZero,
+            "Custom Shape",
+        )
+    }
+
+    /// Show the shape as it stands at `to`. See [`crate::DragPreview`].
+    fn update_preview(&mut self, ctx: &mut ToolCtx, to: (f32, f32)) {
+        let Some(from) = self.anchor else {
+            return;
+        };
+        let fresh = self.build_layer(ctx.doc, from, to, ctx.state.foreground);
+        self.preview.show(ctx.doc, fresh, true);
     }
 
     fn outline(&self, from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {
@@ -587,6 +663,9 @@ impl ToolPlugin for CustomShapeTool {
     }
     fn name(&self) -> &'static str {
         "Custom Shape"
+    }
+    fn description(&self) -> &'static str {
+        "Drag out one of the built-in preset shapes, picked with the Shape option."
     }
     fn icon(&self) -> &'static str {
         "shape-custom"
@@ -616,47 +695,58 @@ impl ToolPlugin for CustomShapeTool {
         self.keep_ratio = input.modifiers.shift;
     }
 
-    fn on_pointer_move(&mut self, _ctx: &mut ToolCtx, input: PointerInput) {
-        if self.anchor.is_some() {
-            self.current = Some((input.x, input.y));
-            self.keep_ratio = input.modifiers.shift;
+    fn on_pointer_move(&mut self, ctx: &mut ToolCtx, input: PointerInput) {
+        if self.anchor.is_none() {
+            return;
+        }
+        let to = (input.x, input.y);
+        let unchanged = self.current == Some(to) && self.keep_ratio == input.modifiers.shift;
+        self.current = Some(to);
+        self.keep_ratio = input.modifiers.shift;
+        if !unchanged || !self.preview.is_showing() {
+            self.update_preview(ctx, to);
         }
     }
 
     fn on_pointer_up(&mut self, ctx: &mut ToolCtx, input: PointerInput) {
-        let Some(from) = self.anchor.take() else {
-            return;
-        };
-        self.current = None;
-        let to = (input.x, input.y);
-        if (to.0 - from.0).abs() < 2.0 && (to.1 - from.1).abs() < 2.0 {
+        if self.anchor.is_none() {
             return;
         }
-        let outline = self.outline(from, to);
-        let mut b = PathBuilder::new();
-        b.move_to(outline[0].0, outline[0].1);
-        for p in &outline[1..] {
-            b.line_to(p.0, p.1);
-        }
-        b.close();
-        let color = ctx.state.foreground;
-        crate::commit_shape(
-            ctx.doc,
-            &b.build(0.25),
-            color,
-            schist_vector::FillRule::NonZero,
-            "Custom Shape",
-        );
-    }
-
-    fn on_cancel(&mut self, _ctx: &mut ToolCtx) {
+        self.on_pointer_move(ctx, input);
         self.anchor = None;
         self.current = None;
+        self.preview.commit(ctx.doc, "Custom Shape");
+    }
+
+    fn on_cancel(&mut self, ctx: &mut ToolCtx) {
+        self.anchor = None;
+        self.current = None;
+        self.preview.discard(ctx.doc);
+    }
+
+    fn on_deactivate(&mut self, ctx: &mut ToolCtx) {
+        self.on_cancel(ctx);
     }
 
     fn overlays(&self, _doc: &Document, _state: &EditorState) -> Vec<Overlay> {
+        // The shape itself is on the canvas while it is dragged; the
+        // overlay is the box it is being fitted into.
         match (self.anchor, self.current) {
-            (Some(a), Some(c)) => vec![Overlay::AntsPolygon(self.outline(a, c))],
+            (Some(a), Some(c)) => {
+                let (x0, y0) = (a.0.min(c.0), a.1.min(c.1));
+                let (mut w, mut h) = ((c.0 - a.0).abs(), (c.1 - a.1).abs());
+                if self.keep_ratio {
+                    let s = w.min(h);
+                    w = s;
+                    h = s;
+                }
+                vec![Overlay::Rect(IntRect::new(
+                    x0.round() as i32,
+                    y0.round() as i32,
+                    (x0 + w).round() as i32,
+                    (y0 + h).round() as i32,
+                ))]
+            }
             _ => Vec::new(),
         }
     }

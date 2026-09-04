@@ -34,6 +34,14 @@ struct Drag {
     start: (f32, f32),
     /// The offset currently applied to the layer.
     offset: (i32, i32),
+    /// Alt was held when the drag began: the layer is a fresh copy and
+    /// the original stays put, as in Photoshop. Decided at press time so
+    /// letting go of Alt mid-drag does not undo the duplicate.
+    duplicated: bool,
+    /// The layer that was selected when the drag began. Cancelling an
+    /// Alt-drag deletes the copy, and the selection has to go back to
+    /// this rather than to a layer that no longer exists.
+    source: schist_core::LayerId,
 }
 
 impl MoveTool {
@@ -87,6 +95,29 @@ impl MoveTool {
     /// and the canvas re-composites and colour-manages what it throws away
     /// -- for a click that moved nothing at all, which is what an ordinary
     /// click with the Move tool is.
+    /// Clone the layer in place for an Alt-drag, returning the copy's id.
+    ///
+    /// Inserted directly rather than through an edit so the drag can move
+    /// it live; `on_pointer_up` folds the insert and the move into one
+    /// undoable step, and `on_cancel` takes it back out.
+    fn duplicate_for_drag(
+        ctx: &mut ToolCtx,
+        layer_id: schist_core::LayerId,
+    ) -> Option<schist_core::LayerId> {
+        let mut copy = ctx.doc.tree.find(layer_id)?.clone();
+        copy.id = schist_core::LayerId::next();
+        copy.name = format!("{} copy", copy.name);
+        let new_id = copy.id;
+        let mut path = ctx.doc.tree.path_of(layer_id)?;
+        // Directly above the original, which is where Photoshop puts it.
+        *path.0.last_mut()? += 1;
+        ctx.doc.tree.insert_at(&path, copy).then(|| {
+            ctx.doc.active_layer = Some(new_id);
+            ctx.doc.damage_all();
+            new_id
+        })
+    }
+
     fn undo_preview(ctx: &mut ToolCtx, layer_id: schist_core::LayerId) {
         let Some(layer) = ctx.doc.tree.find_mut(layer_id) else {
             return;
@@ -99,6 +130,38 @@ impl MoveTool {
         damage = damage.union(&layer.content_bounds());
         ctx.doc.add_damage(damage.inflated(1));
     }
+
+    fn finish(ctx: &mut ToolCtx, drag: Drag, dx: i32, dy: i32) {
+        // Put the layer back where its pixels actually are, then record the
+        // move as one edit so undo restores the original position.
+        Self::undo_preview(ctx, drag.layer);
+        if dx == 0 && dy == 0 && !drag.duplicated {
+            return;
+        }
+        let name = if drag.duplicated {
+            "Duplicate and Move"
+        } else {
+            "Move Layer"
+        };
+        // The copy was inserted straight into the tree so the drag could
+        // move it live. Take it back out and let the edit put it in, so
+        // one undo removes the copy and the move together.
+        let reinsert = drag
+            .duplicated
+            .then(|| ctx.doc.tree.remove(drag.layer))
+            .flatten();
+        let mut edit = ctx.doc.begin_edit(name);
+        if let Some((path, layer)) = reinsert {
+            edit.insert_layer(path, layer);
+        }
+        edit.translate_layer(drag.layer, dx, dy);
+        edit.commit();
+        if drag.duplicated {
+            // `remove_layer` clears the active layer, and the reinsert
+            // above does not know it was the one selected.
+            ctx.doc.active_layer = Some(drag.layer);
+        }
+    }
 }
 
 impl ToolPlugin for MoveTool {
@@ -107,6 +170,10 @@ impl ToolPlugin for MoveTool {
     }
     fn name(&self) -> &'static str {
         "Move"
+    }
+    fn description(&self) -> &'static str {
+        "Drag the active layer's contents to a new position. With Auto-Select on, \
+         the press picks whichever layer -- or whole group -- is under the pointer first."
     }
     fn icon(&self) -> &'static str {
         "move"
@@ -160,18 +227,32 @@ impl ToolPlugin for MoveTool {
         if layer.locked {
             return;
         }
+        // Alt-drag duplicates: the copy is what moves and the original
+        // is left where it was.
+        let source = id;
+        let (id, duplicated) = if input.modifiers.alt {
+            match Self::duplicate_for_drag(ctx, id) {
+                Some(copy) => (copy, true),
+                None => (id, false),
+            }
+        } else {
+            (id, false)
+        };
         self.drag = Some(Drag {
             layer: id,
             start: (input.x, input.y),
             offset: (0, 0),
+            duplicated,
+            source,
         });
     }
 
     fn on_pointer_move(&mut self, ctx: &mut ToolCtx, input: PointerInput) {
         let Some(drag) = &mut self.drag else { return };
-        let offset = (
-            (input.x - drag.start.0).round() as i32,
-            (input.y - drag.start.1).round() as i32,
+        let offset = constrain(
+            input.x - drag.start.0,
+            input.y - drag.start.1,
+            input.modifiers.shift,
         );
         if offset == drag.offset {
             return;
@@ -194,29 +275,61 @@ impl ToolPlugin for MoveTool {
         let Some(drag) = self.drag.take() else { return };
         // Take the offset from the release point: a fast drag can deliver
         // down and up with no move event in between.
-        let (dx, dy) = (
-            (input.x - drag.start.0).round() as i32,
-            (input.y - drag.start.1).round() as i32,
+        let (dx, dy) = constrain(
+            input.x - drag.start.0,
+            input.y - drag.start.1,
+            input.modifiers.shift,
         );
-        // Put the layer back where its pixels actually are, then record the
-        // move as one edit so undo restores the original position.
-        Self::undo_preview(ctx, drag.layer);
-        if dx == 0 && dy == 0 {
-            return;
-        }
-        let mut edit = ctx.doc.begin_edit("Move Layer");
-        edit.translate_layer(drag.layer, dx, dy);
-        edit.commit();
+        Self::finish(ctx, drag, dx, dy);
     }
 
     fn on_cancel(&mut self, ctx: &mut ToolCtx) {
-        if let Some(drag) = self.drag.take() {
-            Self::undo_preview(ctx, drag.layer);
+        let Some(drag) = self.drag.take() else { return };
+        Self::undo_preview(ctx, drag.layer);
+        if drag.duplicated {
+            ctx.doc.tree.remove(drag.layer);
+            // `remove` clears the active layer, and the copy it pointed
+            // at is gone: hand the selection back to the original.
+            ctx.doc.active_layer = Some(drag.source);
+            ctx.doc.damage_all();
         }
+    }
+
+    /// Switching tools mid-drag committed nothing and left the layer
+    /// sitting on its preview `render_offset`, which the next render
+    /// wrote nowhere.
+    fn on_deactivate(&mut self, ctx: &mut ToolCtx) {
+        let Some(drag) = self.drag.take() else { return };
+        let (dx, dy) = drag.offset;
+        Self::finish(ctx, drag, dx, dy);
     }
 
     // No overlay: the layer itself moves, so an outline would just be
     // noise on top of it.
+}
+
+/// A drag offset, snapped to the dominant axis while Shift is held.
+///
+/// Nothing in the move tool read `input.modifiers`, so shift-dragging did
+/// not constrain -- the one gesture every editor has for "move this
+/// straight across".
+fn constrain(dx: f32, dy: f32, shift: bool) -> (i32, i32) {
+    if !shift {
+        return (dx.round() as i32, dy.round() as i32);
+    }
+    // Horizontal, vertical, or the 45-degree diagonal between them,
+    // whichever the drag is closest to.
+    let (ax, ay) = (dx.abs(), dy.abs());
+    let diagonal = (ax - ay).abs() < ax.max(ay) * 0.5;
+    if diagonal {
+        let d = ax.max(ay).round();
+        return ((d * dx.signum()) as i32, (d * dy.signum()) as i32);
+    }
+    if ax >= ay {
+        (dx.round() as i32, 0)
+    } else {
+        (0, dy.round() as i32)
+    }
 }
 
 /// Eyedropper: picks the composited color under the cursor into the
@@ -226,6 +339,11 @@ pub struct EyedropperTool {
     /// Index into `SAMPLE_SIZES`.
     sample: usize,
     current_layer_only: bool,
+    /// True between press and release. The shell forwards every pointer
+    /// move — hovers included — so without this the tool re-sampled as
+    /// the mouse travelled and whatever it crossed last (usually the
+    /// background) silently replaced the colour that was clicked.
+    sampling: bool,
 }
 
 /// Photoshop's sample sizes, and the square each averages over.
@@ -244,6 +362,7 @@ impl EyedropperTool {
         EyedropperTool {
             sample: 0,
             current_layer_only: false,
+            sampling: false,
         }
     }
 
@@ -304,6 +423,10 @@ impl ToolPlugin for EyedropperTool {
     fn name(&self) -> &'static str {
         "Eyedropper"
     }
+    fn description(&self) -> &'static str {
+        "Sample the colour under the pointer into the foreground swatch, or into the \
+         background swatch when alt is held. Dragging keeps sampling."
+    }
     fn icon(&self) -> &'static str {
         "eyedropper"
     }
@@ -332,6 +455,7 @@ impl ToolPlugin for EyedropperTool {
     }
 
     fn on_pointer_down(&mut self, ctx: &mut ToolCtx, input: PointerInput) {
+        self.sampling = true;
         let x = input.x.floor() as i32;
         let y = input.y.floor() as i32;
         if !ctx.doc.canvas_rect().contains(x, y) {
@@ -348,16 +472,21 @@ impl ToolPlugin for EyedropperTool {
     }
 
     fn on_pointer_move(&mut self, ctx: &mut ToolCtx, input: PointerInput) {
-        // Drag keeps sampling, like Photoshop.
-        self.on_pointer_down(ctx, input);
+        // Drag keeps sampling, like Photoshop; a plain hover must not,
+        // or moving the mouse away discards the colour just picked.
+        if self.sampling {
+            self.on_pointer_down(ctx, input);
+        }
     }
 
-    fn on_pointer_up(&mut self, _ctx: &mut ToolCtx, _input: PointerInput) {}
+    fn on_pointer_up(&mut self, _ctx: &mut ToolCtx, _input: PointerInput) {
+        self.sampling = false;
+    }
 }
 
 /// Viewport tools — no-ops at the document level (see module docs).
 macro_rules! viewport_tool {
-    ($ty:ident, $id:literal, $name:literal, $icon:literal, $key:literal) => {
+    ($ty:ident, $id:literal, $name:literal, $desc:literal, $icon:literal, $key:literal) => {
         pub struct $ty;
 
         impl ToolPlugin for $ty {
@@ -366,6 +495,9 @@ macro_rules! viewport_tool {
             }
             fn name(&self) -> &'static str {
                 $name
+            }
+            fn description(&self) -> &'static str {
+                $desc
             }
             fn icon(&self) -> &'static str {
                 $icon
@@ -380,8 +512,24 @@ macro_rules! viewport_tool {
     };
 }
 
-viewport_tool!(HandTool, "hand", "Hand", "hand", "h");
-viewport_tool!(ZoomTool, "zoom", "Zoom", "zoom", "z");
+viewport_tool!(
+    HandTool,
+    "hand",
+    "Hand",
+    "Pans the view. The viewport belongs to the window, so headless this tool does nothing \
+     to the document.",
+    "hand",
+    "h"
+);
+viewport_tool!(
+    ZoomTool,
+    "zoom",
+    "Zoom",
+    "Zooms the view. The viewport belongs to the window, so headless this tool does nothing \
+     to the document.",
+    "zoom",
+    "z"
+);
 
 pub struct BasicToolsPlugin;
 
@@ -742,5 +890,160 @@ mod tests {
         };
         tool.on_pointer_down(&mut ctx, input(20.0, 20.0));
         assert_eq!(state.foreground.to_u8(), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_hover_does_not_overwrite_the_picked_colour() {
+        // The reported bug: the shell forwards hover moves too, and the
+        // tool sampled on every one of them, so travelling across the
+        // background after a click silently replaced the pick.
+        let mut doc = red_square_doc();
+        let mut state = EditorState::default();
+        let mut tool = EyedropperTool::new();
+        let mut ctx = ToolCtx {
+            doc: &mut doc,
+            state: &mut state,
+        };
+        // Click the red square and release: the pick is made.
+        tool.on_pointer_down(&mut ctx, input(20.0, 20.0));
+        tool.on_pointer_up(&mut ctx, input(20.0, 20.0));
+        assert_eq!(ctx.state.foreground.to_u8(), [255, 0, 0, 255]);
+        // Hover away over the empty canvas: the pick must survive.
+        tool.on_pointer_move(&mut ctx, input(200.0, 200.0));
+        assert_eq!(
+            ctx.state.foreground.to_u8(),
+            [255, 0, 0, 255],
+            "moving the mouse after release must not re-sample"
+        );
+        // But a drag (no release between) does keep sampling.
+        tool.on_pointer_down(&mut ctx, input(20.0, 20.0));
+        tool.on_pointer_move(&mut ctx, input(200.0, 200.0));
+        assert_ne!(
+            ctx.state.foreground.to_u8(),
+            [255, 0, 0, 255],
+            "a held button samples wherever it goes"
+        );
+    }
+
+    /// Nothing in the move tool read `input.modifiers`, so shift-dragging
+    /// did not constrain -- the one gesture every editor has for "move
+    /// this straight across".
+    #[test]
+    fn shift_constrains_a_move_to_an_axis() {
+        // Mostly horizontal: the vertical component is dropped.
+        assert_eq!(constrain(100.0, 12.0, true), (100, 0));
+        // Mostly vertical.
+        assert_eq!(constrain(-9.0, -80.0, true), (0, -80));
+        // Close enough to 45 degrees to snap to the diagonal, keeping
+        // both signs.
+        assert_eq!(constrain(60.0, -58.0, true), (60, -60));
+        // Without shift, nothing is constrained.
+        assert_eq!(constrain(100.0, 12.0, false), (100, 12));
+    }
+
+    /// Alt-drag duplicates the layer and moves the copy, leaving the
+    /// original where it was — the standard gesture, and one the move
+    /// tool did not implement at all.
+    #[test]
+    fn alt_dragging_duplicates_the_layer() {
+        let mut doc = red_square_doc();
+        let original = doc.active_layer.unwrap();
+        let before = doc.tree.len();
+        let mut state = EditorState::default();
+        let mut tool = MoveTool::new();
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let at = |x: f32, y: f32| PointerInput {
+            x,
+            y,
+            pressure: 1.0,
+            modifiers: alt,
+        };
+        {
+            let mut ctx = ToolCtx {
+                doc: &mut doc,
+                state: &mut state,
+            };
+            tool.on_pointer_down(&mut ctx, at(60.0, 60.0));
+            tool.on_pointer_move(&mut ctx, at(120.0, 60.0));
+            tool.on_pointer_up(&mut ctx, at(120.0, 60.0));
+        }
+
+        assert_eq!(doc.tree.len(), before + 1, "no copy was made");
+        let copy = doc.active_layer.unwrap();
+        assert_ne!(copy, original, "the original was moved instead of a copy");
+        assert!(doc.tree.find(copy).unwrap().name.ends_with("copy"));
+        assert_eq!(doc.history.undo_name(), Some("Duplicate and Move"));
+
+        // One undo takes back both the copy and the move.
+        doc.undo();
+        assert_eq!(doc.tree.len(), before);
+    }
+
+    /// And cancelling mid-drag takes the copy away rather than leaving a
+    /// stray layer behind.
+    #[test]
+    fn cancelling_an_alt_drag_removes_the_copy() {
+        let mut doc = red_square_doc();
+        let original = doc.active_layer.unwrap();
+        let before = doc.tree.len();
+        let mut state = EditorState::default();
+        let mut tool = MoveTool::new();
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let mut ctx = ToolCtx {
+            doc: &mut doc,
+            state: &mut state,
+        };
+        tool.on_pointer_down(
+            &mut ctx,
+            PointerInput {
+                x: 60.0,
+                y: 60.0,
+                pressure: 1.0,
+                modifiers: alt,
+            },
+        );
+        assert_eq!(ctx.doc.tree.len(), before + 1);
+        tool.on_cancel(&mut ctx);
+        assert_eq!(ctx.doc.tree.len(), before);
+        // And the selection goes back to the layer that is still there:
+        // it pointed at the deleted copy, so every later edit was dropped.
+        assert_eq!(ctx.doc.active_layer, Some(original));
+        assert!(ctx.doc.tree.find(original).is_some());
+    }
+
+    /// Switching tools mid-drag committed nothing and left the layer on
+    /// its preview offset.
+    #[test]
+    fn deactivating_mid_drag_commits_the_move() {
+        let mut doc = red_square_doc();
+        let id = doc.active_layer.unwrap();
+        let mut state = EditorState::default();
+        let mut tool = MoveTool::new();
+        let at = |x: f32, y: f32| PointerInput {
+            x,
+            y,
+            pressure: 1.0,
+            modifiers: Modifiers::default(),
+        };
+        {
+            let mut ctx = ToolCtx {
+                doc: &mut doc,
+                state: &mut state,
+            };
+            tool.on_pointer_down(&mut ctx, at(60.0, 60.0));
+            tool.on_pointer_move(&mut ctx, at(120.0, 60.0));
+            tool.on_deactivate(&mut ctx);
+        }
+
+        assert_eq!(doc.tree.find(id).unwrap().render_offset, (0, 0));
+        assert_eq!(doc.history.undo_name(), Some("Move Layer"));
+        doc.undo();
+        assert_eq!(doc.history.undo_name(), None);
     }
 }
